@@ -76,6 +76,14 @@ public:
 
     void FlushBarriers();
 
+    u64 BarrierEpoch() const noexcept {
+        return barrier_epoch;
+    }
+
+    void SetHostWrittenBuffer(const VideoCore::Buffer* buffer) {
+        host_written_buffer = buffer;
+    }
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -94,6 +102,8 @@ private:
     std::vector<BufferBarriers> resources;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    const VideoCore::Buffer* host_written_buffer{};
+    u64 barrier_epoch{};
 };
 
 } // namespace Vulkan

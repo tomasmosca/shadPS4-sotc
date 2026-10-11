@@ -697,7 +697,11 @@ struct PM4CmdWaitRegMem {
     }
 
     bool Test(std::span<const u32> regs) const {
-        u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
+        return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
+    }
+
+    /// Compares an already read value with the reference.
+    bool TestValue(u32 value) const {
         switch (function.Value()) {
         case Function::Always: {
             return true;
@@ -1212,6 +1216,25 @@ struct PM4CmdMemSemaphore {
         default:
             UNREACHABLE_MSG("Unknown signal type {}", static_cast<u32>(signal_type.Value()));
         }
+    }
+};
+
+struct PM4CmdGetLodStats {
+    PM4Type3Header header;
+    u32 bu_size;
+    u32 base_lo;
+
+    union {
+        BitField<0, 2, u32> base_hi;
+        u32 control;
+    };
+
+    u32 NumBytes() const {
+        return bu_size + 32;
+    }
+
+    VAddr Address() const {
+        return (VAddr{base_lo} << 6) | (VAddr{base_hi.Value()} << 38);
     }
 };
 

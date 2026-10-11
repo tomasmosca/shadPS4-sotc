@@ -7,9 +7,11 @@
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <queue>
 
@@ -29,6 +31,9 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+struct PM4CmdEventWriteEop;
+struct PM4CmdWaitRegMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -60,6 +65,7 @@ struct Liverpool {
     };
 
     Regs regs{};
+    u64 regs_version{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 
@@ -86,6 +92,8 @@ public:
     bool IsGpuIdle() const {
         return num_submits == 0;
     }
+
+    bool IsMapped(VAddr addr, u64 size) const;
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
@@ -193,17 +201,51 @@ private:
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
+    /// Whether a compute submission made before the graphics one numbered gfx_seq can still run.
+    bool EarlierComputeCanRun(u64 gfx_seq);
+    /// Writes a label value the guest reads, after invalidating the GPU copies of it.
+    void WriteLabel(void* address, u64 data, u32 num_bytes);
+    /// Writes a graphics EOP label once the GPU has executed the commands before it.
+    void DeferEopLabel(const PM4CmdEventWriteEop& eop);
+    u64 AddPendingLabel(VAddr addr, u64 value, u32 num_bytes);
+    void RemovePendingLabel(VAddr addr, u64 seq);
+    /// Value a deferred label not written yet will have at addr.
+    std::optional<u32> PendingLabelDword(VAddr addr);
+    bool CpWaitPasses(const PM4CmdWaitRegMem* wait);
+
+    struct PendingLabel {
+        u64 value{};
+        u32 num_bytes{};
+        u64 seq{};
+    };
+
+    struct Submit {
+        Task::Handle handle;
+        u64 seq; ///< Submission order across queues
+    };
+
     struct GpuQueue {
         std::mutex m_access{};
         std::atomic<u32> dcb_buffer_offset;
         std::atomic<u32> ccb_buffer_offset;
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
-        std::queue<Task::Handle> submits{};
+        std::queue<Submit> submits{};
         ComputeProgram cs_state{};
+        // State of the front submission once resumed: what it waits for (the GPU thread only)
+        bool front_started{};
+        const PM4CmdWaitRegMem* front_wait_reg_mem{};
+        bool front_waits_other{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+    std::atomic<u64> last_submit_seq{};
+    u64 current_submit_seq{};
     u32 num_mapped_queues{1u}; // GFX is always available
+
+    std::mutex pending_labels_mutex;
+    std::unordered_map<VAddr, PendingLabel> pending_labels;
+    std::atomic<u32> num_pending_labels{};
+    u64 next_label_seq{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
@@ -230,6 +272,8 @@ private:
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
     const bool guest_markers_enabled;
+    const bool defer_eop_labels;
+    const bool eop_after_earlier_compute;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};

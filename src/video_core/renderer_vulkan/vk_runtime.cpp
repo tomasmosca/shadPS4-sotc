@@ -325,7 +325,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
@@ -433,16 +433,49 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+/// Depth formats whose depth aspect has the same texel layout in a buffer copy
+static u32 DepthCopyClass(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eD16UnormS8Uint:
+        return 1;
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+        return 2;
+    case vk::Format::eX8D24UnormPack32:
+    case vk::Format::eD24UnormS8Uint:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        const bool depth_format_change = src->info.props.is_depth && dst->info.props.is_depth &&
+                                         src->info.pixel_format != dst->info.pixel_format;
+        const u32 src_depth_class = DepthCopyClass(src->info.pixel_format);
+        const bool buffer_depth_copy =
+            depth_format_change && src_depth_class != 0 &&
+            src_depth_class == DepthCopyClass(dst->info.pixel_format) &&
+            src->info.size == dst->info.size &&
+            std::min(src->info.resources.levels, dst->info.resources.levels) == 1;
+        if (!buffer_depth_copy && (instance.IsMaintenance8Supported() ||
+                                   src->info.props.is_depth == dst->info.props.is_depth)) {
             CopyImage(src, dst);
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.
             static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
+            const vk::BufferImageCopy copy = {
+                .imageSubresource{
+                    .layerCount = std::min(src->info.resources.layers, dst->info.resources.layers),
+                },
+                .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+            };
+            const u64 copy_size =
+                std::max<u64>(COPY_BUFFER_SIZE, BufferImageCopySize(copy, src->info.pixel_format));
             const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
+                staging_pool.Request(copy_size, VideoCore::MemoryType::DeviceLocal);
             CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
@@ -689,6 +722,11 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    if (handle == host_written_buffer &&
+        !(src_access & (vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite |
+                        vk::AccessFlagBits2::eMemoryWrite))) {
+        return;
+    }
     MakeCurrent(handle);
 
     const Interval range = {
@@ -701,18 +739,28 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
         vk::AccessFlagBits2::eColorAttachmentRead |
         vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead |
-        vk::AccessFlagBits2::eMemoryRead;
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eIndirectCommandRead;
 
     constexpr static vk::AccessFlags2 WRITE_MASK =
         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
+    // Long lists collapse into one covering interval: inserting into them was slow
+    constexpr std::size_t MaxRanges = 32;
+    const auto add_capped = [](BufferBarriers::AccessList& list, const Interval& value) {
+        list.Add(value);
+        if (list.Size() > MaxRanges) {
+            const Interval covering{list.begin()->start, std::prev(list.end())->end};
+            list.Clear();
+            list.Add(covering);
+        }
+    };
     if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+        add_capped(resource->write_ranges, range);
     }
     if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+        add_capped(resource->read_ranges, range);
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -743,11 +791,17 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
+    ++barrier_epoch;
     for (auto& resource : resources) {
         resource.read_ranges.Clear();
         resource.write_ranges.Clear();
     }
-    resources.clear();
+
+    // Keep the few entries and their lists instead of reallocating them after every barrier
+    constexpr size_t MaxKeptResources = 16;
+    if (resources.size() > MaxKeptResources) {
+        resources.clear();
+    }
     resource = nullptr;
 }
 

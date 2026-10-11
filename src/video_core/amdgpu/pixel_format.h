@@ -97,6 +97,11 @@ enum class CompSwizzle : u8 {
     Alpha = 7,
 };
 
+/// The reserved swizzles 2 and 3 read as zero.
+constexpr CompSwizzle NormalizeCompSwizzle(CompSwizzle swizzle) {
+    return swizzle == CompSwizzle(2) || swizzle == CompSwizzle(3) ? CompSwizzle::Zero : swizzle;
+}
+
 enum class NumberConversion : u32 {
     None = 0,
     UintToUscaled = 1,
@@ -119,6 +124,15 @@ union CompMapping {
 
     bool operator==(const CompMapping& other) const {
         return array == other.array;
+    }
+
+    [[nodiscard]] constexpr CompMapping Normalized() const {
+        return {
+            .r = NormalizeCompSwizzle(r),
+            .g = NormalizeCompSwizzle(g),
+            .b = NormalizeCompSwizzle(b),
+            .a = NormalizeCompSwizzle(a),
+        };
     }
 
     template <typename T>
@@ -157,7 +171,7 @@ union CompMapping {
 private:
     template <typename T>
     T ApplySingle(const std::array<T, 4>& data, const CompSwizzle swizzle) const {
-        switch (swizzle) {
+        switch (NormalizeCompSwizzle(swizzle)) {
         case CompSwizzle::Zero:
             return T(0);
         case CompSwizzle::One:
@@ -356,7 +370,7 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            return NumberConversion::None;
         }
     }
     default:

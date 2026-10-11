@@ -411,7 +411,7 @@ vk::BorderColor BorderColor(AmdGpu::BorderColor color) {
 }
 
 vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
-    switch (comp_swizzle) {
+    switch (AmdGpu::NormalizeCompSwizzle(comp_swizzle)) {
     case AmdGpu::CompSwizzle::Zero:
         return vk::ComponentSwizzle::eZero;
     case AmdGpu::CompSwizzle::One:
@@ -425,7 +425,8 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
     case AmdGpu::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
     default:
-        UNREACHABLE();
+        LOG_ERROR(Render_Vulkan, "Invalid component swizzle {}", u32(comp_swizzle));
+        return vk::ComponentSwizzle::eZero;
     }
 }
 
@@ -779,6 +780,11 @@ static auto surface_format_table = []() constexpr {
     }
     return result;
 }();
+
+bool IsSurfaceFormatSupported(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+    return surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)] !=
+           vk::Format::eUndefined;
+}
 
 vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
