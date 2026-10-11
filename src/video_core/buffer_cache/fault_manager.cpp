@@ -107,7 +107,7 @@ void FaultManager::ProcessFaultBuffer() {
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
         .buffer = fault_buffer.Handle(),
         .offset = 0,
         .size = fault_buffer_size,
@@ -148,6 +148,7 @@ void FaultManager::ProcessFaultBuffer() {
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
+    scheduler.InvalidatePipelineBinds();
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
     // 1 bit per page, 32 pages per workgroup
@@ -164,15 +165,22 @@ void FaultManager::ProcessFaultBuffer() {
     scheduler.DeferOperation([this, mapped, area = current_area] {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
-        const u32 fault_count = fault_buf[0];
+        const u32 fault_count = static_cast<u32>(std::min<u64>(fault_buf[0], MaxPageFaults - 1));
         for (u32 i = 1; i <= fault_count; ++i) {
-            fault_ranges.Add(fault_buf[i], sparse_pagesize);
-            LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
+            const VAddr fault_address = fault_buf[i];
+            if (fault_address == 0 ||
+                !buffer_cache.IsRegionGpuMapped(fault_address, sparse_pagesize)) {
+                continue;
+            }
+
+            fault_ranges.Add(fault_address, sparse_pagesize);
+            LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_address);
         }
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
             (void)buffer_cache.ObtainBuffer(start, end - start, false);
+            buffer_cache.PinForDma(start, end - start);
         });
         fault_areas[area] = 0;
     });

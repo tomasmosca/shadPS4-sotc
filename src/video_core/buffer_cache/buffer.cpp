@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <numeric>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/spin_lock.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -101,6 +103,18 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            static std::once_flag warned;
+            std::call_once(warned, [&] {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer allocation over the VRAM budget, over-subscribing");
+            });
+
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &relaxed, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
@@ -165,6 +179,24 @@ void Buffer::Invalidate(u64 offset, u64 size) {
     vmaInvalidateAllocation(buffer.allocator, buffer.allocation, offset, size);
 }
 
+bool PollMarker(Buffer& marker, const std::function<bool(u32)>& reached,
+                std::chrono::milliseconds timeout) {
+    // Checking the clock and invalidating the marker on every spin would slow the spin down
+    constexpr u32 SpinsPerCheck = 1024;
+    const auto* word = reinterpret_cast<const volatile u32*>(marker.mapped_data.data());
+    const auto limit = std::chrono::steady_clock::now() + timeout;
+    for (u32 spins = 1; !reached(*word); ++spins) {
+        Common::ThreadPause();
+        if (spins % SpinsPerCheck == 0) {
+            marker.Invalidate(0, sizeof(u32));
+            if (std::chrono::steady_clock::now() > limit) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 constexpr u64 WATCHES_INITIAL_RESERVE = 0x100;
 constexpr u64 WATCHES_RESERVE_CHUNK = 0x100;
 
@@ -195,6 +227,7 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
 
     if (offset + size > this->size_bytes) {
         // The buffer would overflow, save the amount of used watches and reset the state.
+        ++wrap_count;
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;

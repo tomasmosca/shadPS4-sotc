@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -129,6 +131,14 @@ struct Buffer {
     UniqueBuffer buffer;
 };
 
+/// Size of the buffers the GPU writes progress markers to.
+constexpr u64 MarkerBufferSize = 256;
+constexpr auto MarkerPollTimeout = std::chrono::milliseconds{20};
+
+/// Spins until reached accepts the first word of marker. Returns false if timeout passed first.
+bool PollMarker(Buffer& marker, const std::function<bool(u32)>& reached,
+                std::chrono::milliseconds timeout = MarkerPollTimeout);
+
 struct StreamBuffer : public Buffer {
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                           MemoryType mem_type, u64 size_bytes);
@@ -145,6 +155,11 @@ struct StreamBuffer : public Buffer {
     /// Tick of the most recent commit into this buffer, 0 if never used.
     [[nodiscard]] u64 LastTick() const noexcept {
         return last_tick;
+    }
+
+    /// Times the ring wrapped (regions mapped before may be overwritten since).
+    [[nodiscard]] u64 WrapCount() const noexcept {
+        return wrap_count;
     }
 
     /// Maps and commits a memory region with user provided data
@@ -181,6 +196,7 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
+    u64 wrap_count{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

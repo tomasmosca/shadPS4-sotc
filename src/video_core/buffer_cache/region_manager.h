@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <mutex>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
@@ -12,6 +15,16 @@
 #include "video_core/page_manager.h"
 
 namespace VideoCore {
+
+/// Regions with pages marked CPU modified since the last DMA sync (see SynchronizeDmaBuffers).
+struct DmaDirtyRegions {
+    static constexpr size_t MaxRegions = 8192;
+    std::mutex mutex;
+    std::array<VAddr, MaxRegions> bases;
+    u32 count = 0;
+    bool overflow = false; ///< some region could not be queued: the next DMA sync walks all
+};
+inline DmaDirtyRegions g_dma_dirty_regions;
 
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 using LockType = Common::AdaptiveMutex;
@@ -31,10 +44,35 @@ public:
         cpu.Fill(~0ULL);
         gpu.Fill(0ULL);
     }
+
     explicit RegionManager() = default;
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
+        NoteDmaDirty();
+    }
+
+    u64 CpuGeneration() const noexcept {
+        return cpu_generation.load(std::memory_order_acquire);
+    }
+
+    void NoteDmaDirty() noexcept {
+        if (!dma_dirty.exchange(true, std::memory_order_acq_rel)) {
+            // Also called from the fault handler: no allocation.
+            std::scoped_lock lk{g_dma_dirty_regions.mutex};
+            auto& q = g_dma_dirty_regions;
+
+            if (q.count < q.bases.size()) {
+                q.bases[q.count++] = cpu_addr;
+            } else {
+                q.overflow = true;
+                dma_dirty.store(false, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void TakeDmaDirty() noexcept {
+        dma_dirty.store(false, std::memory_order_seq_cst);
     }
 
     static constexpr Bounds GetBounds(u64 offset, u64 size) {
@@ -92,6 +130,10 @@ public:
         IterateWords(bounds, [&](u64 index, u64 mask) {
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
         });
+        if constexpr (cpu_op == StateOp::Set) {
+            cpu_generation.fetch_add(1, std::memory_order_release);
+            NoteDmaDirty();
+        }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
@@ -168,6 +210,28 @@ public:
             }
             return state[end_word] & end_mask;
         }
+    }
+
+    template <Type type>
+    bool IsRegionFullyModified(u64 offset, u64 size) noexcept {
+        auto& state = GetRegionBits<type>();
+        const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
+        const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
+        if (start_word == end_word) [[likely]] {
+            const u64 mask = start_mask & end_mask;
+            return (state[start_word] & mask) == mask;
+        }
+
+        if ((state[start_word] & start_mask) != start_mask) {
+            return false;
+        }
+
+        for (s64 i = start_word + 1; i < end_word; ++i) {
+            if (state[i] != ~0ULL) {
+                return false;
+            }
+        }
+        return (state[end_word] & end_mask) == end_mask;
     }
 
     void Lock(const Bounds& bounds) noexcept {
@@ -268,6 +332,8 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr{};
+    std::atomic<u64> cpu_generation{1};
+    std::atomic<bool> dma_dirty{false};
     u32 readbacks_mode;
     RegionBits cpu;
     RegionBits gpu;

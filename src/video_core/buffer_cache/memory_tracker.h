@@ -77,6 +77,47 @@ public:
         }
     }
 
+    /// Lock free: no page is CPU modified and, for a GPU write, all are already GPU modified
+    bool IsSynchronized(VAddr cpu_addr, u64 size, bool is_written) noexcept {
+        u64 remaining_size = size;
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 page_offset = cpu_addr & HIGHER_PAGE_MASK;
+
+        while (remaining_size > 0) {
+            const u64 amount = std::min(HIGHER_PAGE_SIZE - page_offset, remaining_size);
+            RegionManager* region = top_tier[page_index];
+            if (!region || region->template IsRegionModified<Type::CPU>(page_offset, amount)) {
+                return false;
+            }
+            if (is_written &&
+                !region->template IsRegionFullyModified<Type::GPU>(page_offset, amount)) {
+                return false;
+            }
+
+            ++page_index;
+            page_offset = 0;
+            remaining_size -= amount;
+        }
+        return true;
+    }
+
+    /// Queues the existing regions of a range for the next DMA sync.
+    void NoteDmaDirty(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size,
+                     [](RegionManager* manager, u64, u64) { manager->NoteDmaDirty(); });
+    }
+
+    /// Region based at base_addr, or null.
+    RegionManager* RegionAt(VAddr base_addr) const noexcept {
+        return top_tier[base_addr >> HIGHER_PAGE_BITS];
+    }
+
+    /// CPU write generation of the 16 MB region holding cpu_addr, or 0 while it is not tracked
+    u64 CpuGeneration(VAddr cpu_addr) const noexcept {
+        const RegionManager* region = top_tier[cpu_addr >> HIGHER_PAGE_BITS];
+        return region ? region->CpuGeneration() : 0;
+    }
+
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func) {
         IteratePages<true>(

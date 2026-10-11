@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <vector>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -111,6 +114,108 @@ struct RangeSet {
     }
 
     IntervalSet m_ranges_set;
+};
+
+/// RangeSet on a sorted vector of joined intervals: much faster to query than boost::icl
+struct FlatRangeSet {
+    struct Range {
+        VAddr start{};
+        VAddr end{};
+    };
+
+    void Add(VAddr base_address, size_t size) {
+        if (size == 0) {
+            return;
+        }
+
+        VAddr start = base_address;
+        VAddr end = base_address + size;
+        auto first = std::ranges::lower_bound(ranges, start, {}, &Range::end);
+        auto last = first;
+        while (last != ranges.end() && last->start <= end) {
+            start = std::min(start, last->start);
+            end = std::max(end, last->end);
+            ++last;
+        }
+
+        if (first == last) {
+            ranges.insert(first, Range{start, end});
+            return;
+        }
+
+        *first = Range{start, end};
+        ranges.erase(first + 1, last);
+    }
+
+    void Subtract(VAddr base_address, size_t size) {
+        if (size == 0) {
+            return;
+        }
+
+        const VAddr start = base_address;
+        const VAddr end = base_address + size;
+        auto first = std::ranges::upper_bound(ranges, start, {}, &Range::end);
+        auto last = first;
+        while (last != ranges.end() && last->start < end) {
+            ++last;
+        }
+
+        if (first == last) {
+            return;
+        }
+
+        std::array<Range, 2> pieces;
+        size_t n = 0;
+        if (first->start < start) {
+            pieces[n++] = Range{first->start, start};
+        }
+
+        if (const Range& back = *(last - 1); back.end > end) {
+            pieces[n++] = Range{end, back.end};
+        }
+
+        const auto slots = static_cast<size_t>(last - first);
+        if (n <= slots) {
+            std::copy_n(pieces.begin(), n, first);
+            ranges.erase(first + n, last);
+        } else {
+            *first = pieces[0];
+            ranges.insert(first + 1, pieces[1]);
+        }
+    }
+
+    bool Contains(VAddr base_address, size_t size) const {
+        if (size == 0) {
+            return true;
+        }
+
+        const auto it = std::ranges::upper_bound(ranges, base_address, {}, &Range::end);
+        return it != ranges.end() && it->start <= base_address && it->end >= base_address + size;
+    }
+
+    bool Intersects(VAddr base_address, size_t size) const {
+        if (size == 0) {
+            return false;
+        }
+
+        const auto it = std::ranges::upper_bound(ranges, base_address, {}, &Range::end);
+        return it != ranges.end() && it->start < base_address + size;
+    }
+
+    template <typename Func>
+    void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
+        if (ranges.empty() || size == 0) {
+            return;
+        }
+
+        const VAddr end_address = base_addr + size;
+        for (auto it = std::ranges::upper_bound(ranges, base_addr, {}, &Range::end);
+             it != ranges.end() && it->start < end_address; ++it) {
+            func(std::max(it->start, base_addr), std::min(it->end, end_address));
+        }
+    }
+
+    std::vector<Range> ranges;
 };
 
 template <typename T>
