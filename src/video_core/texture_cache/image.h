@@ -47,14 +47,17 @@ struct UniqueImage {
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          size_bytes{other.size_bytes} {}
     UniqueImage& operator=(UniqueImage&& other) {
+        device = other.device;
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        size_bytes = other.size_bytes;
         return *this;
     }
 
@@ -156,6 +159,12 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+
+        /// Layout of subresource mip * layers + layer; `state` is the last transitioned range's.
+        [[nodiscard]] vk::ImageLayout Layout(u32 subres_idx) const {
+            return subres_idx < subresource_states.size() ? subresource_states[subres_idx].layout
+                                                          : state.layout;
+        }
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
@@ -163,7 +172,9 @@ public:
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
+    u64 frame_accessed_last{};
     u64 hash{};
+    bool gpu_written{};
 
     struct {
         u32 texture : 1;

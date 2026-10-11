@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -30,6 +31,8 @@ class Runtime;
 }
 
 namespace VideoCore {
+
+extern std::atomic<u64> g_present_frame;
 
 class BufferCache;
 class PageManager;
@@ -158,6 +161,28 @@ public:
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];
     }
+
+    u64 RangeGeneration(VAddr addr, u64 size) const noexcept {
+        const auto [first, count] = RangeBuckets(addr, size);
+        u64 sum = 0;
+        for (u64 i = 0; i < count; ++i) {
+            sum += range_generations[(first + i) & (NumRangeBuckets - 1)].load(
+                std::memory_order_acquire);
+        }
+        return sum;
+    }
+
+    void MarkImageFound(ImageId image_id);
+
+    bool IsImageLive(ImageId image_id, u64 image_uid) const {
+        if (!image_id || !slot_images.is_allocated(image_id)) {
+            return false;
+        }
+        const Image& image = slot_images[image_id];
+        return image.image_uid == image_uid && True(image.flags & ImageFlagBits::Registered);
+    }
+
+    u64 EmergencyGarbageCollect(u64 bytes);
 
     /// Get the associated depth stencil image if it is still valid.
     ImageId GetAssociatedDepth(Image& image) {
@@ -327,6 +352,16 @@ private:
     void GarbageCollectImages();
     void GarbageCollectSamplers();
 
+    /// First bucket and number of buckets (at most all of them) of a range.
+    static std::pair<u64, u64> RangeBuckets(VAddr addr, u64 size) noexcept {
+        constexpr u64 Margin = 4_KB;
+        const VAddr begin = addr > Margin ? addr - Margin : 0;
+        const VAddr end = addr + std::max<u64>(size, 1) + Margin;
+        const u64 first = begin >> RangeBucketShift;
+        return {first, std::min(((end - 1) >> RangeBucketShift) - first + 1, NumRangeBuckets)};
+    }
+    void BumpRangeGeneration(VAddr addr, u64 size) noexcept;
+
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -349,10 +384,14 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    u64 gc_last_frame = ~0ULL;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
+    static constexpr u64 RangeBucketShift = 22;
+    static constexpr u64 NumRangeBuckets = 4096;
+    std::array<std::atomic<u64>, NumRangeBuckets> range_generations{};
     std::mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;

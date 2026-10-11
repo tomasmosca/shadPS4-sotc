@@ -226,6 +226,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
+    scheduler.InvalidatePipelineBinds();
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
@@ -318,6 +319,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
+    scheduler.InvalidatePipelineBinds();
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),

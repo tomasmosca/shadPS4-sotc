@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <ranges>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -117,6 +118,22 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "Image allocation over the VRAM budget, over-subscribing: {}x{}x{} "
+                        "mips={} layers={} format={} samples={}",
+                        image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+                        image_ci.mipLevels, image_ci.arrayLayers, vk::to_string(image_ci.format),
+                        vk::to_string(image_ci.samples));
+        });
+
+        VmaAllocationCreateInfo relaxed = alloc_ci;
+        relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &relaxed, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
@@ -226,95 +243,92 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
+    constexpr vk::AccessFlags2 explicit_writes =
+        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
+
+    const auto transition = [&](State& state, vk::ImageSubresourceRange range) {
+        if (state.layout == dst_layout && state.access_mask == dst_mask &&
+            !(state.access_mask & explicit_writes)) {
+            state.pl_stage |= dst_stage;
+            return;
+        }
+        barriers.emplace_back(vk::ImageMemoryBarrier2{
+            .srcStageMask = state.pl_stage,
+            .srcAccessMask = state.access_mask,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_mask,
+            .oldLayout = state.layout,
+            .newLayout = dst_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = GetImage(),
+            .subresourceRange = range,
+        });
+        state = {dst_stage, dst_mask, dst_layout};
+    };
+
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
-    const bool partially_transited = !subresource_states.empty();
-
-    if (needs_partial_transition || partially_transited) {
-        if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
-            std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+    if (needs_partial_transition || !subresource_states.empty()) {
+        if (subresource_states.empty()) {
+            subresource_states.assign(info.resources.levels * info.resources.layers, last_state);
         }
-
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
         // resource transition for the next time.
-        const auto mips =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.level,
-                                           subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, info.resources.levels);
-        const auto layers =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.layer,
-                                           subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, info.resources.layers);
-
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
+        SubresourceRange range =
+            needs_partial_transition ? *subres_range : SubresourceRange{{}, info.resources};
+        if (range.base.level + range.extent.levels > info.resources.levels ||
+            range.base.layer + range.extent.layers > info.resources.layers) {
+            static std::once_flag logged;
+            std::call_once(logged, [&] {
+                LOG_ERROR(Render_Vulkan,
+                          "Image barrier range past the image: levels {}+{} of {}, layers {}+{} "
+                          "of {}; clamped",
+                          range.base.level, range.extent.levels, info.resources.levels,
+                          range.base.layer, range.extent.layers, info.resources.layers);
+            });
+            range.base.level = std::min(range.base.level, info.resources.levels - 1);
+            range.base.layer = std::min(range.base.layer, info.resources.layers - 1);
+            range.extent.levels =
+                std::min(range.extent.levels, info.resources.levels - range.base.level);
+            range.extent.layers =
+                std::min(range.extent.layers, info.resources.layers - range.base.layer);
+        }
+        vk::PipelineStageFlags2 stages{};
+        for (u32 mip = range.base.level; mip < range.base.level + range.extent.levels; ++mip) {
+            for (u32 layer = range.base.layer; layer < range.base.layer + range.extent.layers;
+                 ++layer) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
                 const auto subres_idx = mip * info.resources.layers + layer;
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
-
-                if (state.layout != dst_layout || state.access_mask != dst_mask) {
-                    barriers.emplace_back(vk::ImageMemoryBarrier2{
-                        .srcStageMask = state.pl_stage,
-                        .srcAccessMask = state.access_mask,
-                        .dstStageMask = dst_stage,
-                        .dstAccessMask = dst_mask,
-                        .oldLayout = state.layout,
-                        .newLayout = dst_layout,
-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
-                        .subresourceRange{
-                            .aspectMask = aspect_mask,
-                            .baseMipLevel = mip,
-                            .levelCount = 1,
-                            .baseArrayLayer = layer,
-                            .layerCount = 1,
-                        },
-                    });
-                    state.layout = dst_layout;
-                    state.access_mask = dst_mask;
-                    state.pl_stage = dst_stage;
-                }
+                transition(state, {
+                                      .aspectMask = aspect_mask,
+                                      .baseMipLevel = mip,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = layer,
+                                      .layerCount = 1,
+                                  });
+                stages |= state.pl_stage;
             }
         }
-
+        last_state = {stages, dst_mask, dst_layout};
         if (!needs_partial_transition) {
             subresource_states.clear();
         }
     } else { // Full resource transition
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask) {
-            return;
-        }
-        barriers.emplace_back(vk::ImageMemoryBarrier2{
-            .srcStageMask = last_state.pl_stage,
-            .srcAccessMask = last_state.access_mask,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_mask,
-            .oldLayout = last_state.layout,
-            .newLayout = dst_layout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = GetImage(),
-            .subresourceRange{
-                .aspectMask = aspect_mask,
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        });
+        transition(last_state, {
+                                   .aspectMask = aspect_mask,
+                                   .baseMipLevel = 0,
+                                   .levelCount = VK_REMAINING_MIP_LEVELS,
+                                   .baseArrayLayer = 0,
+                                   .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                               });
     }
-
-    last_state.layout = dst_layout;
-    last_state.access_mask = dst_mask;
-    last_state.pl_stage = dst_stage;
 }
 
 } // namespace VideoCore
