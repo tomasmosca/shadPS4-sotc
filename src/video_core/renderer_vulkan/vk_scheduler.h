@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <boost/container/small_vector.hpp>
 #include <queue>
 
 #include "common/interval_set.h"
@@ -20,9 +23,14 @@ namespace tracy {
 class VkCtxScope;
 }
 
+namespace VideoCore {
+class Buffer;
+}
+
 namespace Vulkan {
 
 class Instance;
+class CommandRecorder;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -352,7 +360,7 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    explicit Scheduler(const Instance& instance, bool record_thread = false);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -371,6 +379,21 @@ public:
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
+
+    /// Runs a sparse bind in submission order; immediate callers hold submit_mutex.
+    void RunOnQueue(Common::UniqueFunction<void>&& func);
+
+    /// Waits until tick reached the queue. Does not flush: another thread must submit it if needed.
+    void WaitSubmitted(u64 tick);
+
+    /// Makes the calling thread the producer (shutdown on another thread).
+    void ClaimRecorder();
+
+    /// A command buffer submitted ahead of the batch being recorded (readbacks it does not write).
+    vk::CommandBuffer BeginAhead();
+
+    /// Submits the command buffer of BeginAhead and waits until the GPU has executed it.
+    void SubmitAheadAndWait();
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -407,6 +430,24 @@ public:
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
         return sessions.back().primary;
+    }
+
+    /// Binds the pipeline unless the current command buffer already has it bound.
+    void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
+        auto& bound = point == vk::PipelineBindPoint::eCompute ? bound_compute_pipeline
+                                                               : bound_graphics_pipeline;
+        if (bound == pipeline) {
+            return;
+        }
+
+        bound = pipeline;
+        CommandBuffer().bindPipeline(point, pipeline);
+    }
+
+    /// Needed after binding a pipeline directly on the current command buffer.
+    void InvalidatePipelineBinds() noexcept {
+        bound_graphics_pipeline = vk::Pipeline{};
+        bound_compute_pipeline = vk::Pipeline{};
     }
 
     /// Returns the current command buffer tick.
@@ -448,9 +489,23 @@ public:
     static std::mutex submit_mutex;
 
 private:
+    using CommandBufferList = boost::container::small_vector<vk::CommandBuffer, 8>;
+
     void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
+
+    /// Takes the command buffers of all sessions (upload first) and clears the sessions.
+    CommandBufferList TakeSessionBuffers();
+
+    /// Submits command buffers with the semaphores of info. The caller holds submit_mutex.
+    vk::Result QueueSubmit(const SubmitInfo& info, const CommandBufferList& cmd_buffers);
+
+    /// Prepares the submit here and queues it on the recording thread after its commands.
+    void SubmitRecorded(SubmitInfo& info);
+
+    /// Begins the real command buffer on the recording thread and binds it to the fake handle.
+    void BeginRecorded(vk::CommandBuffer fake);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -459,6 +514,8 @@ private:
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
+    vk::Pipeline bound_graphics_pipeline{};
+    vk::Pipeline bound_compute_pipeline{};
     SessionFunc on_session{};
     SubmitFunc on_submit{};
     struct Session {
@@ -480,6 +537,20 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+    vk::UniqueCommandPool ahead_pool;
+    vk::CommandBuffer ahead_cmdbuf{};
+
+    struct AheadSlot {
+        vk::CommandBuffer cmdbuf{};
+        vk::UniqueFence fence;
+        bool pending{};
+    };
+    std::array<AheadSlot, 4> ahead_slots{};
+    u32 ahead_index{};
+    u32 ahead_seq{};
+    std::unique_ptr<VideoCore::Buffer> ahead_marker;
+    std::atomic<u64> recorded_submit_tick{};
+    std::unique_ptr<CommandRecorder> recorder;
 };
 
 } // namespace Vulkan

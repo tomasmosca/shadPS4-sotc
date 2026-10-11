@@ -1,19 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <limits>
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
+#include "common/spin_lock.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+Scheduler::Scheduler(const Instance& instance, bool record_thread)
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
+      recorder{record_thread && !TRACY_GPU_ENABLED ? std::make_unique<CommandRecorder>()
+                                                   : nullptr} {
+    if (recorder) {
+        LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
+    }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -23,6 +34,9 @@ Scheduler::Scheduler(const Instance& instance)
 }
 
 Scheduler::~Scheduler() {
+    // The worker uses members that are destroyed before it
+    priority_pending_ops_thread.request_stop();
+    priority_pending_ops_thread.join();
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -96,6 +110,11 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     if (upload_cmdbuf) {
         return upload_cmdbuf;
     }
+    if (recorder) {
+        upload_cmdbuf = recorder->NewFakeHandle();
+        recorder->Run([this, fake = upload_cmdbuf] { BeginRecorded(fake); });
+        return upload_cmdbuf;
+    }
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
@@ -122,18 +141,166 @@ void Scheduler::Finish() {
     Wait(presubmit_tick);
 }
 
+void Scheduler::RunOnQueue(Common::UniqueFunction<void>&& func) {
+    if (!recorder) {
+        func();
+        return;
+    }
+    recorder->Run([func = std::move(func)]() mutable {
+        std::scoped_lock lk{submit_mutex};
+        func();
+    });
+}
+
+void Scheduler::WaitSubmitted(u64 tick) {
+    if (!recorder) {
+        return;
+    }
+    u64 submitted = recorded_submit_tick.load(std::memory_order_acquire);
+    if (submitted >= tick) [[likely]] {
+        return;
+    }
+    // The recording thread may still be replaying earlier commands: spin briefly, then sleep
+    constexpr u32 SpinCount = 4096;
+    for (u32 spins = 0; spins < SpinCount &&
+                        (submitted = recorded_submit_tick.load(std::memory_order_acquire)) < tick;
+         ++spins) {
+        Common::ThreadPause();
+    }
+    while (submitted < tick) {
+        recorded_submit_tick.wait(submitted, std::memory_order_acquire);
+        submitted = recorded_submit_tick.load(std::memory_order_acquire);
+    }
+}
+
+void Scheduler::ClaimRecorder() {
+    if (recorder) {
+        recorder->ClaimProducer();
+    }
+}
+
+vk::CommandBuffer Scheduler::BeginAhead() {
+    const vk::Device device = instance.GetDevice();
+    if (!ahead_pool) {
+        ahead_pool = Check(device.createCommandPoolUnique(vk::CommandPoolCreateInfo{
+            .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                     vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        }));
+        const auto cmdbufs = Check(device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
+            .commandPool = *ahead_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = static_cast<u32>(ahead_slots.size()),
+        }));
+        for (size_t i = 0; i < ahead_slots.size(); ++i) {
+            ahead_slots[i].cmdbuf = cmdbufs[i];
+            ahead_slots[i].fence = Check(device.createFenceUnique(vk::FenceCreateInfo{}));
+        }
+        ahead_marker = std::make_unique<VideoCore::Buffer>(instance, 0, VideoCore::MarkerBufferSize,
+                                                           VideoCore::MemoryType::HostCached,
+                                                           "Ahead copy marker");
+        std::memset(ahead_marker->mapped_data.data(), 0, VideoCore::MarkerBufferSize);
+    }
+    auto& slot = ahead_slots[ahead_index];
+    if (slot.pending) {
+        Check(device.waitForFences(*slot.fence, true, std::numeric_limits<u64>::max()));
+        Check(device.resetFences(*slot.fence));
+        slot.pending = false;
+    }
+    ahead_cmdbuf = slot.cmdbuf;
+
+    WaitSubmitted(CurrentTick() - 1);
+    Check(ahead_cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    const vk::MemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    ahead_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &pre_barrier,
+    });
+    return ahead_cmdbuf;
+}
+
+void Scheduler::SubmitAheadAndWait() {
+    const u32 seq = ++ahead_seq;
+    const vk::MemoryBarrier2 copy_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+    };
+    ahead_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &copy_barrier,
+    });
+    ahead_cmdbuf.fillBuffer(ahead_marker->Handle(), 0, 4, seq);
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    ahead_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &host_barrier,
+    });
+    Check(ahead_cmdbuf.end());
+    const vk::SubmitInfo submit_info = {
+        .commandBufferCount = 1,
+        .pCommandBuffers = &ahead_cmdbuf,
+    };
+    auto& slot = ahead_slots[ahead_index];
+    ahead_index = (ahead_index + 1) % static_cast<u32>(ahead_slots.size());
+    {
+        std::scoped_lock lk{submit_mutex};
+        const auto result = instance.GetGraphicsQueue().submit(submit_info, *slot.fence);
+        ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during ahead submit");
+    }
+    slot.pending = true;
+
+    // The marker is faster; the fence still reports a stalled GPU or a lost device
+    const bool done =
+        VideoCore::PollMarker(*ahead_marker, [seq](u32 marker) { return marker == seq; });
+    if (!done) {
+        const vk::Device device = instance.GetDevice();
+        Check(device.waitForFences(*slot.fence, true, std::numeric_limits<u64>::max()));
+        Check(device.resetFences(*slot.fence));
+        slot.pending = false;
+    }
+}
+
+void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
+    const vk::CommandBuffer real = command_pool.Commit();
+    Check(real.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    recorder->Bind(fake, real);
+}
+
 void Scheduler::Wait(u64 tick) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
+    WaitSubmitted(tick);
     work_semaphore.Wait(tick);
 }
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
-    work_semaphore.Refresh();
+    // Called per draw: ask for the GPU tick only once the oldest operation was submitted
+    if (pending_ops.empty() || pending_ops.front().gpu_tick >= CurrentTick()) {
+        return;
+    }
+    if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        work_semaphore.Refresh();
+    }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
@@ -145,14 +312,20 @@ void Scheduler::BeginSession() {
 
     auto& session = sessions.emplace_back();
 
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-    session.primary = command_pool.Commit();
-    Check(session.primary.begin(begin_info));
+    if (recorder) {
+        session.primary = recorder->NewFakeHandle();
+        recorder->Run([this, fake = session.primary] { BeginRecorded(fake); });
+    } else {
+        const vk::CommandBufferBeginInfo begin_info = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        session.primary = command_pool.Commit();
+        Check(session.primary.begin(begin_info));
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    InvalidatePipelineBinds();
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -183,6 +356,10 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    if (recorder) {
+        SubmitRecorded(info);
+        return;
+    }
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -200,9 +377,23 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     EndSession();
 
-    std::vector<vk::CommandBuffer> cmd_buffers;
-    cmd_buffers.reserve(sessions.size() * 2);
+    const auto cmd_buffers = TakeSessionBuffers();
 
+    const vk::Semaphore timeline = work_semaphore.Handle();
+    info.AddSignal(timeline, signal_value);
+
+    const auto submit_result = QueueSubmit(info, cmd_buffers);
+    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+
+    work_semaphore.Refresh();
+    BeginSession();
+
+    // Apply pending operations
+    PopPendingOperations();
+}
+
+Scheduler::CommandBufferList Scheduler::TakeSessionBuffers() {
+    CommandBufferList cmd_buffers;
     for (const auto& session : sessions) {
         if (session.upload) {
             cmd_buffers.push_back(session.upload);
@@ -210,10 +401,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         cmd_buffers.push_back(session.primary);
     }
     sessions.clear();
+    return cmd_buffers;
+}
 
-    const vk::Semaphore timeline = work_semaphore.Handle();
-    info.AddSignal(timeline, signal_value);
-
+vk::Result Scheduler::QueueSubmit(const SubmitInfo& info, const CommandBufferList& cmd_buffers) {
     static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -238,13 +429,42 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     };
 
     ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    return instance.GetGraphicsQueue().submit(submit_info, info.fence);
+}
+
+void Scheduler::SubmitRecorded(SubmitInfo& info) {
+    // Prepared like SubmitExecution; the queue submit is recorded after its commands
+    const u64 signal_value = work_semaphore.NextTick();
+    if (on_submit) {
+        on_submit(info);
+    }
+    EndSession();
+
+    auto fakes = TakeSessionBuffers();
+
+    const vk::Semaphore timeline = work_semaphore.Handle();
+    info.AddSignal(timeline, signal_value);
+
+    recorder->Run([this, info, fakes = std::move(fakes), signal_value] {
+        CommandBufferList cmd_buffers;
+        for (const vk::CommandBuffer fake : fakes) {
+            cmd_buffers.push_back(recorder->Real(fake));
+        }
+        vk::Result submit_result;
+        {
+            std::scoped_lock lk{submit_mutex};
+            submit_result = QueueSubmit(info, cmd_buffers);
+        }
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost,
+                   "Device lost during submit (recording thread)");
+        recorded_submit_tick.store(signal_value, std::memory_order_release);
+        recorded_submit_tick.notify_all();
+        recorder->Retire(static_cast<u32>(fakes.size()));
+    });
+    recorder->Kick();
 
     work_semaphore.Refresh();
     BeginSession();
-
-    // Apply pending operations
     PopPendingOperations();
 }
 
@@ -265,6 +485,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
+        WaitSubmitted(op.gpu_tick);
         work_semaphore.Wait(op.gpu_tick);
         if (stoken.stop_requested()) {
             break;
