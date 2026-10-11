@@ -11,6 +11,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#include "shader_recompiler/ir/passes/srt_walker_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
@@ -107,11 +108,16 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     }
 
     std::shared_lock lk{mutex};
-    ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
-               virtual_addr);
+    if (!IsValidMapping(virtual_addr)) {
+        LOG_WARNING(Kernel_Vmm, "Attempted to access invalid address {:#x}", virtual_addr);
+        return 0;
+    }
 
     // Clamp size to the remaining size of the current VMA.
     auto vma = FindVMA(virtual_addr);
+    if (vma->second.IsFree()) {
+        return 0;
+    }
     u64 clamped_size = vma->second.base + vma->second.size - virtual_addr;
     ++vma;
 
@@ -127,6 +133,52 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
                   virtual_addr, size, clamped_size);
     }
     return clamped_size;
+}
+
+bool MemoryManager::IsAllocatedAddress(VAddr virtual_addr) {
+    // Called for every bound V#/T#: caches the VMAs found per thread until the VMA map changes
+    struct Entry {
+        u64 generation{~0ULL};
+        VAddr begin{};
+        VAddr end{};
+    };
+
+    constexpr u64 GranuleBits = 20;
+    constexpr u64 SlotBits = 10;
+    static thread_local std::array<Entry, 1u << SlotBits> cache;
+    if (impl.BackingAddress(virtual_addr)) {
+        return true;
+    }
+
+    constexpr u64 FibonacciHash = 0x9E3779B97F4A7C15ULL;
+    auto& entry = cache[((virtual_addr >> GranuleBits) * FibonacciHash) >> (64 - SlotBits)];
+    const u64 generation = vma_generation.load(std::memory_order_acquire);
+    if (entry.generation == generation && virtual_addr >= entry.begin && virtual_addr < entry.end) {
+        return true;
+    }
+
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr)) {
+        return false;
+    }
+
+    const auto& vma = FindVMA(virtual_addr)->second;
+    if (vma.IsFree()) {
+        return false;
+    }
+
+    entry = {generation, vma.base, vma.base + vma.size};
+    return true;
+}
+
+u64 MemoryManager::ClampRangeSizeToVma(VAddr virtual_addr, u64 size) {
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr)) {
+        return size;
+    }
+
+    const auto vma = FindVMA(virtual_addr);
+    return std::min<u64>(size, vma->second.base + vma->second.size - virtual_addr);
 }
 
 void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
@@ -900,6 +952,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     u64 size_to_unmap = size;
     VAddr unmapped_addr = impl.Unmap(virtual_addr, &size_to_unmap);
     rasterizer->RegisterMemory(unmapped_addr, size_to_unmap);
+    Shader::g_walker_page_cache.DropAll();
 
     // Tracy memory tracking breaks from merging memory areas. Disabled for now.
     // TRACK_FREE(virtual_addr, "VMEM");
@@ -982,6 +1035,8 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
         ASSERT_MSG(size_to_free == 0, "Failed to unmap physical memory");
     }
 
+    vma_generation.fetch_add(1, std::memory_order_release);
+
     // Mark region as free and attempt to coalesce it with neighbours.
     const auto new_it = CarveVMA(virtual_addr, size_in_vma);
     auto& vma = new_it->second;
@@ -1001,6 +1056,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
         // TRACK_FREE(virtual_addr, "VMEM");
     }
+    Shader::g_walker_page_cache.DropAll();
     return size_in_vma;
 }
 
@@ -1106,7 +1162,7 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
 
     // Perform address-space memory protections if needed.
     if (new_prot != old_prot) {
-        impl.Protect(addr, adjusted_size, perms);
+        impl.ProtectGuest(addr, adjusted_size, perms);
     }
 
     return adjusted_size;

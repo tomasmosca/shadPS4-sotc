@@ -5,8 +5,10 @@
 
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "core/guest_stacks.h"
 #include "core/libraries/fiber/fiber_error.h"
 #include "core/libraries/libs.h"
+#include "core/memory.h"
 #include "core/tls.h"
 
 namespace Libraries::Fiber {
@@ -18,6 +20,18 @@ static constexpr u64 kFiberStackSignature = 0x7149f2ca7149f2ca;
 static constexpr u64 kFiberStackSizeCheck = 0xdeadbeefdeadbeef;
 
 static std::atomic<u32> context_size_check = false;
+
+/// Keeps a fiber stack out of GPU memory tracking
+static void RegisterFiberStack(const OrbisFiber* fiber, void* addr_context, u64 size_context) {
+    using Core::GuestStacks::PageSize;
+    const VAddr start = reinterpret_cast<VAddr>(addr_context);
+    Core::GuestStacks::Register(start, size_context, fiber);
+
+    const VAddr page_begin = Common::AlignDown(start, PageSize);
+    const VAddr page_end = Common::AlignUp(start + size_context, PageSize);
+    Core::Memory::Instance()->GetAddressSpace().Protect(page_begin, page_end - page_begin,
+                                                        Core::MemoryPermission::ReadWrite);
+}
 
 OrbisFiberContext* GetFiberContext() {
     return Core::GetTcbBase()->tcb_fiber;
@@ -61,6 +75,7 @@ s32 PS4_SYSV_ABI _sceFiberAttachContext(OrbisFiber* fiber, void* addr_context, u
     fiber->size_context = size_context;
     fiber->context_start = addr_context;
     fiber->context_end = reinterpret_cast<u8*>(addr_context) + size_context;
+    RegisterFiberStack(fiber, addr_context, size_context);
 
     /* Apply signature to start of stack */
     *(u64*)addr_context = kFiberStackSignature;
@@ -207,6 +222,7 @@ s32 PS4_SYSV_ABI sceFiberInitializeImpl(OrbisFiber* fiber, const char* name, Orb
     if (addr_context != nullptr) {
         fiber->context_start = addr_context;
         fiber->context_end = reinterpret_cast<u8*>(addr_context) + size_context;
+        RegisterFiberStack(fiber, addr_context, size_context);
 
         /* Apply signature to start of stack */
         *(u64*)addr_context = kFiberStackSignature;
@@ -252,6 +268,9 @@ s32 PS4_SYSV_ABI sceFiberFinalize(OrbisFiber* fiber) {
     FiberState expected = FiberState::Idle;
     if (!fiber->state.compare_exchange_strong(expected, FiberState::Terminated)) {
         return ORBIS_FIBER_ERROR_STATE;
+    }
+    if (fiber->addr_context) {
+        Core::GuestStacks::Unregister(reinterpret_cast<VAddr>(fiber->addr_context), fiber);
     }
 
     return ORBIS_OK;

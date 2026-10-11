@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/logging/log.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
@@ -14,6 +15,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <xbyak/xbyak.h>
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>
@@ -27,7 +29,40 @@ namespace Core {
 
 #if defined(_WIN32)
 
-static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+// The exception handler runs on its own stack, as with SA_ONSTACK: fiber stacks are too small
+namespace {
+
+constexpr size_t AltStackSize = 256_KB;
+constexpr u32 Win64ShadowSpace = 32;
+
+using HandlerFn = LONG(WINAPI*)(EXCEPTION_POINTERS*);
+using CallOnStackFn = LONG (*)(EXCEPTION_POINTERS*, HandlerFn, u8* stack_top);
+
+thread_local u8* t_alt_stack{};
+thread_local bool t_alt_stack_in_use{};
+
+/// Generates handler(exception) called with rsp = stack_top (16-byte aligned).
+CallOnStackFn GenerateCallOnStack() {
+    using namespace Xbyak::util;
+    static Xbyak::CodeGenerator c(64);
+    // Win64 arguments: rcx = exception, rdx = handler, r8 = stack top
+    c.mov(rax, rsp);
+    c.mov(rsp, r8);
+    c.push(rax);                      // the caller's rsp
+    c.sub(rsp, Win64ShadowSpace + 8); // + 8 keeps the call 16-byte aligned after the push
+    c.call(rdx);
+    c.add(rsp, Win64ShadowSpace + 8);
+    c.pop(rsp);
+    c.ret();
+    c.ready();
+    return c.getCode<CallOnStackFn>();
+}
+
+CallOnStackFn g_call_on_stack{};
+
+} // Anonymous namespace
+
+static LONG WINAPI SignalHandlerImpl(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
 
@@ -142,10 +177,31 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        Common::Log::Flush();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+    const DWORD last_error = GetLastError();
+    if (!t_alt_stack) {
+        t_alt_stack = static_cast<u8*>(
+            VirtualAlloc(nullptr, AltStackSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    }
+
+    LONG result;
+    if (t_alt_stack && !t_alt_stack_in_use) {
+        t_alt_stack_in_use = true;
+        result = g_call_on_stack(pExp, &SignalHandlerImpl, t_alt_stack + AltStackSize);
+        t_alt_stack_in_use = false;
+    } else {
+        result = SignalHandlerImpl(pExp);
+    }
+
+    SetLastError(last_error);
+    return result;
 }
 
 #else
@@ -316,8 +372,18 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
 
 #endif
 
+void ReleaseThreadSignalStack() {
+#ifdef _WIN32
+    if (t_alt_stack && !t_alt_stack_in_use) {
+        VirtualFree(t_alt_stack, 0, MEM_RELEASE);
+        t_alt_stack = nullptr;
+    }
+#endif
+}
+
 SignalDispatch::SignalDispatch() {
 #if defined(_WIN32)
+    g_call_on_stack = GenerateCallOnStack();
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
 #else

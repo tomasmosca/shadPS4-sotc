@@ -26,6 +26,9 @@ public:
 
     void Initialize();
 
+    /// Whether the thread stopped running (on Windows, faults on its stack would kill the process).
+    bool HasExited() const;
+
     uintptr_t GetHandle() {
         return reinterpret_cast<uintptr_t>(native_handle);
     }

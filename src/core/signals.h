@@ -18,6 +18,9 @@ namespace Core {
 using AccessViolationHandler = bool (*)(void* context, void* fault_address);
 using IllegalInstructionHandler = bool (*)(void* context);
 
+/// Frees the exception handler stack of the calling thread, if it has one.
+void ReleaseThreadSignalStack();
+
 #ifndef _WIN32
 void SignalHandler(int sig, siginfo_t* info, void* raw_context);
 #endif

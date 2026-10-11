@@ -4,6 +4,7 @@
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/scope_exit.h"
+#include "core/guest_stacks.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/sleepq.h"
@@ -37,10 +38,12 @@ void ThreadState::Collect(Pthread* curthread) {
         std::scoped_lock lk{thread_list_lock};
         for (auto it = gc_list.begin(); it != gc_list.end();) {
             Pthread* td = *it;
-            if (td->tid != TidTerminated) {
+            // Its stack is reused and stops being exempt from GPU tracking: the thread must be gone
+            if (td->tid != TidTerminated || (td->native_thr && !td->native_thr->HasExited())) {
                 ++it;
                 continue;
             }
+            Core::GuestStacks::Unregister(reinterpret_cast<VAddr>(td->attr.stackaddr_attr), td);
             FreeStack(&td->attr);
             work_list.push_back(td);
             it = gc_list.erase(it);

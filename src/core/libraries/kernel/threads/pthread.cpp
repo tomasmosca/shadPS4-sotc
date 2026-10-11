@@ -10,6 +10,7 @@
 #include <pthread.h>
 #endif
 #include "core/debug_state.h"
+#include "core/guest_stacks.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -18,6 +19,7 @@
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
+#include "core/signals.h"
 
 #if defined(ARCH_X86_64) || defined(__arm64__) || defined(__aarch64__)
 extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func,
@@ -50,6 +52,8 @@ static void ExitThread() {
         /* Run the thread-specific data destructors: */
         _thread_cleanupspecific();
     }
+
+    Core::ReleaseThreadSignalStack();
 
     auto* thread_state = ThrState::Instance();
     ASSERT(thread_state->active_threads.fetch_sub(1) != 1);
@@ -269,6 +273,8 @@ static void* RunThread(void* arg) {
     /* Run the current thread's start routine with argument: */
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
+    Core::GuestStacks::Register(reinterpret_cast<VAddr>(curthread->attr.stackaddr_attr),
+                                curthread->attr.stacksize_attr, curthread);
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
 
     /* Remove thread from tracking */

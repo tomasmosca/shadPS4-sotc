@@ -13,6 +13,7 @@
 #include "core/libraries/kernel/memory.h"
 #include "core/memory.h"
 #include "libraries/error_codes.h"
+#include "video_core/page_manager.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -289,7 +290,31 @@ struct AddressSpace::Impl {
                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
         }
         ASSERT_MSG(ptr, "{}", Common::GetLastErrorMsg());
+        ReapplyTracking(virtual_addr, size, prot);
         return ptr;
+    }
+
+    // Mapping a view resets the GPU tracker's protection of its pages: re-apply it under the lock
+    void ReapplyTracking(VAddr base, u64 size, ULONG region_prot) {
+        if (region_prot == PAGE_NOACCESS) {
+            return;
+        }
+        const bool exec = region_prot == PAGE_EXECUTE_READWRITE ||
+                          region_prot == PAGE_EXECUTE_READ || region_prot == PAGE_EXECUTE;
+        const bool region_read_only =
+            region_prot == PAGE_READONLY || region_prot == PAGE_EXECUTE_READ;
+        VideoCore::PageManager::ForEachProtectedRun(
+            base, size, [&](VAddr addr, u64 len, bool read) {
+                if (read && region_read_only) {
+                    return;
+                }
+                DWORD flags = PAGE_NOACCESS;
+                if (read) {
+                    flags = exec ? PAGE_EXECUTE_READ : PAGE_READONLY;
+                }
+                DWORD old_flags{};
+                VirtualProtectEx(process, reinterpret_cast<LPVOID>(addr), len, flags, &old_flags);
+            });
     }
 
     void UnmapRegion(MemoryRegion* region) {
@@ -509,7 +534,8 @@ struct AddressSpace::Impl {
         return virtual_addr;
     }
 
-    void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
+    void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute,
+                 bool keep_tracking = false) {
         std::scoped_lock lk{mutex};
         DWORD new_flags{};
 
@@ -548,8 +574,15 @@ struct AddressSpace::Impl {
         }
 
         const VAddr virtual_end = virtual_addr + size;
-        auto it = --regions.upper_bound(virtual_addr);
-        ASSERT_MSG(it != regions.end(), "addr {:#x} out of bounds", virtual_addr);
+        auto it = regions.upper_bound(virtual_addr);
+        if (it == regions.begin()) {
+            LOG_ERROR(Core, "Protect {:#x} size {:#x} below the address space", virtual_addr, size);
+            if (it == regions.end() || it->first >= virtual_end) {
+                return;
+            }
+        } else {
+            --it;
+        }
         for (; it->first < virtual_end; it++) {
             if (!it->second.is_mapped) {
                 continue;
@@ -564,6 +597,9 @@ struct AddressSpace::Impl {
                     "{:#x}, error {}",
                     virtual_addr, size, Common::GetLastErrorMsg());
             }
+        }
+        if (keep_tracking && (read || write)) {
+            ReapplyTracking(virtual_addr, size, new_flags);
         }
     }
 
@@ -872,6 +908,17 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     const bool write = True(perms & MemoryPermission::Write);
     const bool execute = True(perms & MemoryPermission::Execute);
     return impl->Protect(virtual_addr, size, read, write, execute);
+}
+
+void AddressSpace::ProtectGuest(VAddr virtual_addr, u64 size, MemoryPermission perms) {
+#ifdef _WIN32
+    const bool read = True(perms & MemoryPermission::Read);
+    const bool write = True(perms & MemoryPermission::Write);
+    const bool execute = True(perms & MemoryPermission::Execute);
+    impl->Protect(virtual_addr, size, read, write, execute, true);
+#else
+    Protect(virtual_addr, size, perms);
+#endif
 }
 
 boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {

@@ -47,7 +47,7 @@ void NativeThread::Exit() {
     tid = 0;
 
 #ifdef _WIN64
-    native_handle = nullptr;
+    // The handle stays valid for HasExited
     ExitThread(0);
 #else
     // Disable and free the signal stack.
@@ -61,6 +61,15 @@ void NativeThread::Exit() {
         sig_stack_ptr = nullptr;
     }
     pthread_exit(nullptr);
+#endif
+}
+
+bool NativeThread::HasExited() const {
+#ifdef _WIN64
+    return !native_handle || WaitForSingleObject(native_handle, 0) == WAIT_OBJECT_0;
+#else
+    // A fault on a protected stack is handled on the signal stack
+    return true;
 #endif
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -205,11 +206,18 @@ public:
         return impl.SystemReservedVirtualBase();
     }
 
+    VAddr SystemManagedVirtualBase() noexcept {
+        return impl.SystemManagedVirtualBase();
+    }
+
     bool IsValidGpuMapping(VAddr virtual_addr, u64 size) {
         // The PS4's GPU can only handle 40 bit addresses.
         const VAddr max_gpu_address{0x10000000000};
         return virtual_addr + size < max_gpu_address;
     }
+
+    /// True when the address lies in a VMA that is not free.
+    bool IsAllocatedAddress(VAddr virtual_addr);
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
         const auto end_it = std::prev(vma_map.end());
@@ -249,6 +257,8 @@ public:
     }
 
     u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+
+    u64 ClampRangeSizeToVma(VAddr virtual_addr, u64 size);
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
@@ -356,6 +366,7 @@ private:
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
+    std::atomic<u64> vma_generation{0};
 
     struct PrtArea {
         VAddr start;

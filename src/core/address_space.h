@@ -46,6 +46,14 @@ public:
         return backing_pages;
     }
 
+    static constexpr u64 BackingPageSize = 1ULL << Traits::PAGE_BITS;
+
+    /// Null when the address has no backing memory.
+    [[nodiscard]] u8* BackingAddress(VAddr virtual_addr) const noexcept {
+        const auto* entry = backing_pages.find(virtual_addr >> Traits::PAGE_BITS);
+        return entry && *entry ? *entry + (virtual_addr & (BackingPageSize - 1)) : nullptr;
+    }
+
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);
     }
@@ -99,6 +107,9 @@ public:
 
     /// Protects requested region.
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
+
+    /// Protect that keeps the protection set by the GPU memory tracker.
+    void ProtectGuest(VAddr virtual_addr, u64 size, MemoryPermission perms);
 
     // Returns an interval set containing all usable regions.
     boost::icl::interval_set<VAddr> GetUsableRegions();

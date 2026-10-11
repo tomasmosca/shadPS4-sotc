@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
@@ -55,6 +56,13 @@ public:
     static constexpr VAddr GetNextPageAddr(VAddr addr) {
         return Common::AlignUp(addr + 1, PM_PAGE_SIZE);
     }
+
+    /// Calls fn(addr, size, read) for the runs of pages protected beyond read-write, except stacks.
+    static void ForEachProtectedRun(VAddr base, u64 size,
+                                    const std::function<void(VAddr, u64, bool)>& fn);
+
+    /// True when a page of the range is read protected: only those can hold pending GPU data.
+    static bool IsReadProtected(VAddr addr, u64 size);
 
 private:
     friend struct UffdImpl;

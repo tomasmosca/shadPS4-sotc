@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -12,8 +14,10 @@
 #include "common/signal_context.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/guest_stacks.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "shader_recompiler/ir/passes/srt_walker_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -39,17 +43,20 @@ namespace VideoCore {
 
 struct PageManager::Impl {
     struct PageState {
-        u8 num_write_watchers;
-        u8 num_read_watchers;
+        // Changed under the page locks, read without them by IsReadProtected and the remap path
+        std::atomic<u8> num_write_watchers;
+        std::atomic<u8> num_read_watchers;
 
         Core::MemoryPermission WritePerm() const noexcept {
-            return num_write_watchers == 0 ? Core::MemoryPermission::Write
-                                           : Core::MemoryPermission::None;
+            return num_write_watchers.load(std::memory_order_relaxed) == 0
+                       ? Core::MemoryPermission::Write
+                       : Core::MemoryPermission::None;
         }
 
         Core::MemoryPermission ReadPerm() const noexcept {
-            return num_read_watchers == 0 ? Core::MemoryPermission::Read
-                                          : Core::MemoryPermission::None;
+            return num_read_watchers.load(std::memory_order_relaxed) == 0
+                       ? Core::MemoryPermission::Read
+                       : Core::MemoryPermission::None;
         }
 
         Core::MemoryPermission Perms() const noexcept {
@@ -59,30 +66,33 @@ struct PageManager::Impl {
         template <bool is_read>
         u8 GetPage() const {
             if constexpr (is_read) {
-                return num_read_watchers;
+                return num_read_watchers.load(std::memory_order_relaxed);
             } else {
-                return num_write_watchers;
+                return num_write_watchers.load(std::memory_order_relaxed);
             }
         }
 
-        constexpr Core::MemoryPermission Update(PageOp write_op, bool update_write = true,
-                                                PageOp read_op = PageOp::None,
-                                                bool update_read = false) {
+        Core::MemoryPermission Update(PageOp write_op, bool update_write = true,
+                                      PageOp read_op = PageOp::None, bool update_read = false) {
             if (update_read) {
+                const u8 count = num_read_watchers.load(std::memory_order_relaxed);
                 if (read_op == PageOp::Track) {
-                    ASSERT_MSG(num_read_watchers == 0, "Too many watchers");
+                    ASSERT_MSG(count == 0, "Too many watchers");
                 } else if (read_op == PageOp::Untrack) {
-                    ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
+                    ASSERT_MSG(count > 0, "Not enough watchers");
                 }
-                num_read_watchers += std::to_underlying(read_op);
+                num_read_watchers.store(static_cast<u8>(count + std::to_underlying(read_op)),
+                                        std::memory_order_relaxed);
             }
             if (update_write) {
+                const u8 count = num_write_watchers.load(std::memory_order_relaxed);
                 if (write_op == PageOp::Track) {
-                    ASSERT_MSG(num_write_watchers < 255, "Too many watchers");
+                    ASSERT_MSG(count < 255, "Too many watchers");
                 } else if (write_op == PageOp::Untrack) {
-                    ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
+                    ASSERT_MSG(count > 0, "Not enough watchers");
                 }
-                num_write_watchers += std::to_underlying(write_op);
+                num_write_watchers.store(static_cast<u8>(count + std::to_underlying(write_op)),
+                                         std::memory_order_relaxed);
             }
             return Perms();
         }
@@ -145,6 +155,7 @@ struct PageManager::Impl {
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(page);
             if (!state) {
+                release_pending();
                 continue;
             }
 
@@ -210,6 +221,7 @@ struct PageManager::Impl {
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(base_page + page);
             if (!state) {
+                release_pending();
                 continue;
             }
 
@@ -224,6 +236,9 @@ struct PageManager::Impl {
             const bool update_write = write_op != PageOp::None && write_mask.GetPage(page);
             const bool update_read = read_op != PageOp::None && read_mask.GetPage(page);
             const auto new_perms = state->Update(write_op, update_write, read_op, update_read);
+            if (update_read && read_op == PageOp::Track) {
+                Shader::g_walker_page_cache.Drop(base_page + page);
+            }
 
             if (new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -428,7 +443,32 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
-        impl.Protect(address, size, perms);
+        if (perms == Core::MemoryPermission::ReadWrite) {
+            impl.Protect(address, size, perms);
+            return;
+        }
+
+        const u64 generation = Core::GuestStacks::Generation();
+        Core::GuestStacks::ForEachPiece(address, size, [&](VAddr begin, VAddr end, bool stack) {
+            if (!stack) {
+                impl.Protect(begin, end - begin, perms);
+                return;
+            }
+
+            static std::once_flag reports;
+            std::call_once(reports, [&] {
+                LOG_WARNING(Render_Vulkan, "Not protecting guest stack pages {:#x}-{:#x}", begin,
+                            end);
+            });
+        });
+        // A stack registered meanwhile may have been protected above: open its pages again
+        if (Core::GuestStacks::Generation() != generation) {
+            Core::GuestStacks::ForEachPiece(address, size, [&](VAddr begin, VAddr end, bool stack) {
+                if (stack) {
+                    impl.Protect(begin, end - begin, Core::MemoryPermission::ReadWrite);
+                }
+            });
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
@@ -445,6 +485,72 @@ struct SignalImpl : public PageManager::Impl {
     }
 };
 
+/// For the static queries: the address space has no PageManager.
+static SignalImpl* g_signal_impl = nullptr;
+
+void PageManager::ForEachProtectedRun(VAddr base, u64 size,
+                                      const std::function<void(VAddr, u64, bool)>& fn) {
+    if (!g_signal_impl || size == 0) {
+        return;
+    }
+
+    const u64 first_page = base >> PM_PAGE_BITS;
+    const u64 end_page = Common::DivCeil(base + size, PM_PAGE_SIZE);
+    u64 run_start = 0;
+    u64 run_pages = 0;
+    auto run_perms = Core::MemoryPermission::ReadWrite;
+    const auto flush = [&] {
+        if (run_pages == 0) {
+            return;
+        }
+
+        const bool read = True(run_perms & Core::MemoryPermission::Read);
+        Core::GuestStacks::ForEachPiece(run_start << PM_PAGE_BITS, run_pages << PM_PAGE_BITS,
+                                        [&](VAddr begin, VAddr end, bool stack) {
+                                            if (!stack) {
+                                                fn(begin, end - begin, read);
+                                            }
+                                        });
+        run_pages = 0;
+    };
+
+    for (u64 page = first_page; page < end_page; ++page) {
+        const auto* state = g_signal_impl->cached_pages.find(page);
+        const auto perms = state ? state->Perms() : Core::MemoryPermission::ReadWrite;
+        if (perms == Core::MemoryPermission::ReadWrite) {
+            flush();
+            continue;
+        }
+
+        if (run_pages != 0 && perms == run_perms && run_start + run_pages == page) {
+            ++run_pages;
+            continue;
+        }
+
+        flush();
+        run_start = page;
+        run_pages = 1;
+        run_perms = perms;
+    }
+    flush();
+}
+
+bool PageManager::IsReadProtected(VAddr addr, u64 size) {
+    if (!g_signal_impl) {
+        return true;
+    }
+
+    const u64 last = (addr + size - 1) >> PM_PAGE_BITS;
+    for (u64 page = addr >> PM_PAGE_BITS; page <= last; ++page) {
+        const auto* state = g_signal_impl->cached_pages.find(page);
+        if (state && state->num_read_watchers.load(std::memory_order_relaxed) != 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 #ifdef __linux__
     if (EmulatorSettings.IsUserfaultfdTracking()) {
@@ -459,9 +565,12 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     LOG_INFO(Config, "Memory tracking method: signals");
 #endif
     impl = std::make_unique<SignalImpl>(rasterizer_);
+    g_signal_impl = static_cast<SignalImpl*>(impl.get());
 }
 
-PageManager::~PageManager() = default;
+PageManager::~PageManager() {
+    g_signal_impl = nullptr;
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

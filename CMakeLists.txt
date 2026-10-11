@@ -943,6 +943,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/debug_state.h
          src/core/debugger.cpp
          src/core/debugger.h
+         src/core/guest_stacks.h
          src/core/linker.cpp
          src/core/linker.h
          src/core/memory.cpp
