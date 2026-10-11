@@ -7,6 +7,9 @@
 
 namespace Common {
 
+/// Hints the CPU that the calling thread is in a spin-wait loop.
+void ThreadPause();
+
 /**
  * SpinLock class
  * a lock similar to mutex that forces a thread to spin wait instead calling the

@@ -30,7 +30,7 @@ public:
     [[nodiscard]] Entry* find(size_t page) {
         const size_t l1_page = page >> L2_BITS;
         const size_t l2_page = page & (NUM_L1_ENTRIES - 1);
-        if (!top_level[l1_page]) [[unlikely]] {
+        if (l1_page >= top_level.size() || !top_level[l1_page]) [[unlikely]] {
             return nullptr;
         }
         return &(*top_level[l1_page])[l2_page];
@@ -39,7 +39,7 @@ public:
     [[nodiscard]] const Entry* find(size_t page) const {
         const size_t l1_page = page >> L2_BITS;
         const size_t l2_page = page & (NUM_L1_ENTRIES - 1);
-        if (!top_level[l1_page]) [[unlikely]] {
+        if (l1_page >= top_level.size() || !top_level[l1_page]) [[unlikely]] {
             return nullptr;
         }
         return &(*top_level[l1_page])[l2_page];

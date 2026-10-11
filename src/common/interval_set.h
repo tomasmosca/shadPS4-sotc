@@ -86,6 +86,11 @@ public:
         Coalesce(at, m);
     }
 
+    /// Removes the intervals for which pred returns true.
+    void EraseIf(auto&& pred) {
+        std::erase_if(intervals, pred);
+    }
+
     /// Returns immutable iterator to an interval that contains provided address.
     const_iterator Find(u64 addr) const {
         auto it = std::ranges::upper_bound(intervals, addr, {}, &IV::end);

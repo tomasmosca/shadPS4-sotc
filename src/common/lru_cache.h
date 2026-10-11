@@ -17,6 +17,7 @@ class LeastRecentlyUsedCache {
         TickType tick;
         Item* next{};
         Item* prev{};
+        bool linked{};
     };
 
 public:
@@ -32,31 +33,42 @@ public:
         return new_id;
     }
 
-    void Touch(size_t id, TickType tick) {
+    /// Returns false for a freed item, which must not be linked back into the list.
+    bool Touch(size_t id, TickType tick) {
         auto& item = item_pool[id];
+        if (!item.linked) {
+            return false;
+        }
         if (item.tick >= tick) {
-            return;
+            return true;
         }
         item.tick = tick;
         if (&item == last_item) {
-            return;
+            return true;
         }
         Detach(item);
         Attach(item);
+        return true;
     }
 
-    void Free(size_t id) {
+    /// Returns false when the item was already freed.
+    bool Free(size_t id) {
         auto& item = item_pool[id];
+        if (!item.linked) {
+            return false;
+        }
         Detach(item);
         item.prev = nullptr;
         item.next = nullptr;
+        item.linked = false;
         free_items.push_back(id);
+        return true;
     }
 
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
         Item* iterator = first_item;
         while (iterator) {
             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
@@ -92,6 +104,7 @@ private:
     }
 
     void Attach(Item& item) {
+        item.linked = true;
         if (!first_item) {
             first_item = &item;
         }
