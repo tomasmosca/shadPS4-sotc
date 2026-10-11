@@ -14,6 +14,8 @@ struct Profile {
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
     u32 sparse_page_shift{};
+    u32 shader_loop_cap{};
+    u32 dynamic_tsharp_array_size{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};
@@ -52,6 +54,12 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    bool nan_aware_min_max{};
+    bool relative_instance_id{};
+    bool wave64_uniform_branches{};
+    bool wave64_missing_lane_identity{};
+    bool lds_barriers_large_groups{};
+    bool lds_barrier_uniform_readlane{};
 
     bool operator==(const Profile&) const = default;
 };

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <ranges>
 
 #include "common/hash.h"
@@ -180,6 +183,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        const auto z_order = regs.depth_shader_control.z_order;
+        info.hw.fs.early_fragment_tests =
+            early_fragment_tests_from_z_order &&
+            (z_order == AmdGpu::ZOrder::EarlyZLateZ || z_order == AmdGpu::ZOrder::EarlyZReZ) &&
+            (info.hw.fs.mrtz_mask & 0b111) == 0;
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =
@@ -268,6 +276,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+      specialization_memo{EmulatorSettings.IsSpecializationMemo()},
+      early_fragment_tests_from_z_order{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -277,6 +287,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supported_spirv = SpirvVersion1_6,
         .subgroup_size = instance.SubgroupSize(),
         .sparse_page_shift = sparse_page_shift,
+        .shader_loop_cap = EmulatorSettings.GetShaderLoopCap(),
+        .dynamic_tsharp_array_size = instance.IsSampledImageArrayDynamicIndexingSupported()
+                                         ? std::min(EmulatorSettings.GetDynamicTsharpArraySize(),
+                                                    Shader::MAX_TSHARP_ARRAY_SIZE)
+                                         : 0U,
         .support_int8 = instance.IsShaderInt8Supported(),
         .support_int16 = instance.IsShaderInt16Supported(),
         .support_int64 = instance.IsShaderInt64Supported(),
@@ -323,6 +338,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .nan_aware_min_max = EmulatorSettings.IsNanAwareMinMax(),
+        .relative_instance_id = EmulatorSettings.IsRelativeInstanceId(),
+        .wave64_uniform_branches = EmulatorSettings.IsWave64UniformBranches(),
+        .wave64_missing_lane_identity = EmulatorSettings.IsWave64MissingLaneIdentity(),
+        .lds_barriers_large_groups = EmulatorSettings.IsLdsBarriersLargeGroups(),
+        .lds_barrier_uniform_readlane = EmulatorSettings.IsLdsBarrierUniformReadlane(),
     };
     WarmUp();
 
@@ -650,6 +671,59 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+// What StageSpecialization reads from the sharps, without addresses: equal ones specialize alike
+// V#: stride and swizzle bits (top of the first qword), formats and swizzles (high dword after it)
+constexpr u32 BufferStrideShift = 48;
+constexpr u64 BufferFormatMask = 0xFFFFFFFF00000000ULL;
+constexpr u64 ImageFormatMask = 0xFFF000C000000000ULL;
+
+template <typename T>
+static std::array<u64, sizeof(T) / sizeof(u64)> AsQwords(const T& value) {
+    static_assert(sizeof(T) % sizeof(u64) == 0);
+    std::array<u64, sizeof(T) / sizeof(u64)> qwords;
+    std::memcpy(qwords.data(), &value, sizeof(T));
+    return qwords;
+}
+
+static void SpecResourceFingerprint(const Shader::Info& info,
+                                    boost::container::small_vector<u64, 48>& out) {
+    out.clear();
+    for (const auto& desc : info.buffers) {
+        const AmdGpu::Buffer sharp = desc.GetSharp(info);
+        const auto raw = AsQwords(sharp);
+        out.push_back(raw[0] >> BufferStrideShift);
+        out.push_back((raw[1] & BufferFormatMask) | u64{sharp ? 1u : 0u});
+    }
+
+    for (const auto& desc : info.images) {
+        const AmdGpu::Image sharp = desc.GetSharp(info);
+        const auto raw = AsQwords(sharp);
+        out.push_back((raw[0] & ImageFormatMask) | u64{sharp ? 1u : 0u});
+        out.push_back(raw[1] >> 32); // swizzles, levels and type
+    }
+
+    for (const auto& desc : info.fmasks) {
+        const auto raw = AsQwords(desc.GetSharp(info));
+        out.insert(out.end(), raw.begin(), raw.end());
+    }
+
+    for (const auto& desc : info.samplers) {
+        const auto raw = AsQwords(desc.GetSharp(info));
+        out.insert(out.end(), raw.begin(), raw.end());
+    }
+}
+
+static void SpecAttribFingerprint(const Shader::Info& info,
+                                  const Shader::Gcn::FetchShaderData& fetch,
+                                  boost::container::small_vector<u64, 16>& out) {
+    out.clear();
+    for (const auto& attrib : fetch.attributes) {
+        const AmdGpu::Buffer sharp = attrib.GetSharp(info);
+        const auto raw = AsQwords(sharp);
+        out.push_back((raw[1] & BufferFormatMask) | u64{sharp ? 1u : 0u});
+    }
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -659,13 +733,16 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        const u32 first_idx =
+            Storage::DataBase::Instance().AllocateShaderBinaryIndex(params.hash, 0);
+        const auto module =
+            CompileModule(program->info, runtime_info, params.code, first_idx, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(params.hash, static_cast<size_t>(first_idx));
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
+        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, first_idx);
+        program->InsertPermut(module, std::move(spec), first_idx);
+        if (auto& fetch = program->modules[first_idx].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
         }
         return std::make_tuple(&program->info, module, perm_hash);
@@ -676,6 +753,54 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    const bool use_memo = specialization_memo && sw_stage != SwStage::TessellationControl &&
+                          sw_stage != SwStage::TessellationEval;
+    const bool has_fetch = sw_stage == SwStage::Vertex && info.has_fetch_shader;
+    const u64 fetch_addr = has_fetch ? reinterpret_cast<u64>(Shader::Gcn::GetFetchShaderCode(
+                                           info, info.fetch_shader_sgpr_base))
+                                     : 0;
+    const Shader::Backend::Bindings start_binding = binding;
+    boost::container::small_vector<u64, 48> resource_fp;
+
+    if (use_memo) {
+        SpecResourceFingerprint(info, resource_fp);
+        boost::container::small_vector<u64, 16> attrib_fp;
+        for (auto& memo : program->spec_memo) {
+            const bool has_module =
+                memo.perm_idx < program->modules.size() && program->modules[memo.perm_idx].module;
+            const bool same_inputs = memo.start == start_binding && memo.fetch_addr == fetch_addr &&
+                                     memo.resources == resource_fp &&
+                                     memo.runtime_info == runtime_info;
+            if (!has_module || !same_inputs) {
+                continue;
+            }
+
+            if (has_fetch) {
+                const auto& fetch = program->modules[memo.perm_idx].spec.fetch_shader_data;
+                if (memo.fetch_code.size() != fetch.size ||
+                    std::memcmp(memo.fetch_code.data(), reinterpret_cast<const void*>(fetch_addr),
+                                fetch.size) != 0) {
+                    continue;
+                }
+
+                SpecAttribFingerprint(info, fetch, attrib_fp);
+                if (attrib_fp != memo.attribs) {
+                    continue;
+                }
+            }
+
+            const u32 perm_idx = memo.perm_idx;
+            info.AddBindings(binding);
+            program->last_match = perm_idx;
+            if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+                fetch_shader = &fetch;
+            }
+
+            return std::make_tuple(&program->info, program->modules[perm_idx].module,
+                                   HashCombine(params.hash, static_cast<size_t>(perm_idx)));
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -683,13 +808,24 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    // Stored permutation indices can leave empty slots (no module): never match those.
+    const auto matches = [&](const Program::Module& m) { return m.module && m.spec == spec; };
+    auto it = program->last_match < program->modules.size() &&
+                      matches(program->modules[program->last_match])
+                  ? program->modules.begin() + program->last_match
+                  : std::ranges::find_if(program->modules, matches);
+    if (it != program->modules.end()) {
+        program->last_match = static_cast<size_t>(std::distance(program->modules.begin(), it));
+    }
     if (it == program->modules.end()) {
+        perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(
+            params.hash, static_cast<u32>(program->modules.size()));
+        perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = it->module;
@@ -698,6 +834,22 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
+    }
+    if (use_memo && program->modules[perm_idx].module) {
+        auto& memo = program->spec_memo[program->spec_memo_next++ % program->spec_memo.size()];
+        memo.resources = resource_fp;
+        memo.runtime_info = runtime_info;
+        memo.start = start_binding;
+        memo.fetch_addr = fetch_addr;
+        memo.perm_idx = static_cast<u32>(perm_idx);
+        memo.attribs.clear();
+        memo.fetch_code.clear();
+        if (has_fetch) {
+            const auto& fetch = program->modules[perm_idx].spec.fetch_shader_data;
+            const auto* code = reinterpret_cast<const u8*>(fetch_addr);
+            memo.fetch_code.assign(code, code + fetch.size);
+            SpecAttribFingerprint(info, fetch, memo.attribs);
+        }
     }
     return std::make_tuple(&program->info, module, perm_hash);
 }

@@ -307,6 +307,8 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
+        u32 array_size{};
+        Id array_element_pointer_type{};
     };
 
     enum class PointerType : u32 {

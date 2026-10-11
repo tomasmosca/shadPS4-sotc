@@ -12,8 +12,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 6u;
-static constexpr u32 ShaderMetaVersion = 6u;
+static constexpr u32 ShaderBinaryVersion = 14u;
+static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
@@ -206,6 +206,10 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
+
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -272,7 +276,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
+        // Empty slots (stored indices leave gaps) never match.
+        const auto& it =
+            std::ranges::find_if(it_pgm.value()->modules, [&](const Program::Module& m) {
+                return m.module && m.spec == spec;
+            });
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means
             // the store holds entries from more than one cache generation, so this pipeline is
@@ -410,6 +418,7 @@ void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {
     fetch.Write(vertex_offset_sgpr);
     fetch.Write(instance_offset_sgpr);
     fetch.Write(attributes);
+    fetch.Write(one_vgprs);
 }
 
 bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
@@ -419,6 +428,7 @@ bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
     fetch.Read(vertex_offset_sgpr);
     fetch.Read(instance_offset_sgpr);
     fetch.Read(attributes);
+    fetch.Read(one_vgprs);
 
     return true;
 }

@@ -48,6 +48,18 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    size_t last_match{};
+    struct SpecMemo {
+        boost::container::small_vector<u64, 48> resources;
+        boost::container::small_vector<u64, 16> attribs;
+        std::vector<u8> fetch_code;
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        u64 fetch_addr{};
+        u32 perm_idx = ~0u;
+    };
+    std::array<SpecMemo, 4> spec_memo{};
+    u32 spec_memo_next{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -122,6 +134,8 @@ private:
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
+    const bool specialization_memo;
+    const bool early_fragment_tests_from_z_order;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;

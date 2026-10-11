@@ -43,6 +43,7 @@ struct InfoPersistent {
     ImageResourceList images;
     SamplerResourceList samplers;
     FMaskResourceList fmasks;
+    SharpTableList sharp_tables;
 
     u32 fetch_shader_sgpr_base{};
     u32 shared_memory_scratch_size{};
@@ -162,6 +163,9 @@ struct Info : InfoPersistent {
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
         bnd.unified += buffers.size() + images.size() + samplers.size();
+        for (const auto& image : images) {
+            bnd.unified += image.array_size;
+        }
     }
 
     void RefreshFlatBuf() {
@@ -169,9 +173,15 @@ struct Info : InfoPersistent {
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
+                                 Shader::GetWalkerLoadHelpers());
+        }
+        if (!sharp_tables.empty()) {
+            RefreshSharpTables();
         }
     }
+
+    void RefreshSharpTables();
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD

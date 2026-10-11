@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <mutex>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
@@ -66,6 +68,10 @@ ArgType Arg(EmitContext& ctx, const IR::Value& arg) {
     } else if constexpr (std::is_same_v<ArgType, const IR::Value&>) {
         return arg;
     } else if constexpr (std::is_same_v<ArgType, u32>) {
+        if (const IR::Inst* handle = arg.TryInst();
+            handle && handle->GetOpcode() == IR::Opcode::ImageArrayHandle) {
+            return handle->Arg(0).U32();
+        }
         return arg.U32();
     } else if constexpr (std::is_same_v<ArgType, u64>) {
         return arg.U64();
@@ -154,6 +160,21 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    // Cap iterations: a trip count read from non-resident data can loop until a GPU reset
+    const u32 loop_cap = ctx.profile.shader_loop_cap;
+    std::vector<Id> loop_counters;
+    std::unordered_map<const IR::Block*, Id> merge_counters;
+    std::vector<Id> counter_pool;
+    size_t next_counter{};
+    size_t num_loops{};
+
+    if (loop_cap != 0) {
+        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+            num_loops += node.type == IR::AbstractSyntaxNode::Type::Loop;
+        }
+    }
+
+    bool first_block = true;
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -163,8 +184,30 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (first_block) {
+                first_block = false;
+                for (size_t i = 0; i < num_loops; ++i) {
+                    counter_pool.push_back(ctx.AddLocalVariable(
+                        ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]),
+                        spv::StorageClass::Function, ctx.u32_zero_value));
+                }
+            }
+
+            Id reset_counter{};
+            if (const auto it = merge_counters.find(node.data.block); it != merge_counters.end()) {
+                reset_counter = it->second;
+            }
+
             for (IR::Inst& inst : node.data.block->Instructions()) {
+                if (Sirit::ValidId(reset_counter) && inst.GetOpcode() != IR::Opcode::Phi) {
+                    ctx.OpStore(reset_counter, ctx.u32_zero_value);
+                    reset_counter = Id{};
+                }
                 EmitInst(ctx, &inst);
+            }
+
+            if (Sirit::ValidId(reset_counter)) {
+                ctx.OpStore(reset_counter, ctx.u32_zero_value);
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;
@@ -183,6 +226,11 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
 
             ctx.OpLoopMerge(endloop_label, continue_label, spv::LoopControlMask::MaskNone);
             ctx.OpBranch(body_label);
+            if (loop_cap != 0) {
+                const Id counter{counter_pool[next_counter++]};
+                loop_counters.push_back(counter);
+                merge_counters[node.data.loop.merge] = counter;
+            }
             break;
         }
         case IR::AbstractSyntaxNode::Type::Break: {
@@ -198,6 +246,16 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (!loop_counters.empty()) {
+                const Id counter{loop_counters.back()};
+                loop_counters.pop_back();
+
+                const Id next{
+                    ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], counter), ctx.ConstU32(1U))};
+                ctx.OpStore(counter, next);
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], next, ctx.ConstU32(loop_cap)));
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
@@ -286,6 +344,10 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
     if (info.has_image_gather) {
         ctx.AddCapability(spv::Capability::ImageGatherExtended);
+    }
+    if (std::ranges::any_of(info.images,
+                            [](const ImageResource& image) { return image.array_size != 0; })) {
+        ctx.AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
     }
     if (info.has_image_query) {
         ctx.AddCapability(spv::Capability::ImageQuery);
@@ -430,6 +492,15 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
+        }
+
+        if (ctx.runtime_info.hw.fs.early_fragment_tests) {
+            const bool exports_depth_or_coverage = info.stores.GetAny(IR::Attribute::Depth) ||
+                                                   info.stores.Get(IR::Attribute::StencilRef) ||
+                                                   info.stores.Get(IR::Attribute::SampleMask);
+            if (info.has_storage_images && !info.has_discard && !exports_depth_or_coverage) {
+                ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
+            }
         }
         break;
     case SwStage::Geometry:

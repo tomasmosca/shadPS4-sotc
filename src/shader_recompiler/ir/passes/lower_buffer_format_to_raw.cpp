@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -24,6 +25,35 @@ static bool IsBufferFormatLoad(const IR::Inst& inst) {
 
 static bool IsBufferFormatStore(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32;
+}
+
+/// Garbage V#s carry format pairs the pack/unpack emitters do not support.
+static bool IsLowerableFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+    using AmdGpu::DataFormat;
+    using AmdGpu::NumberFormat;
+    const bool is_int = num_format == NumberFormat::Uint || num_format == NumberFormat::Sint;
+    const bool is_norm_or_int =
+        is_int || num_format == NumberFormat::Unorm || num_format == NumberFormat::Snorm;
+    switch (data_format) {
+    case DataFormat::Format10_11_11:
+        return num_format == NumberFormat::Float;
+    case DataFormat::Format8:
+    case DataFormat::Format8_8:
+    case DataFormat::Format8_8_8_8:
+    case DataFormat::Format2_10_10_10:
+        return is_norm_or_int;
+    case DataFormat::Format16:
+    case DataFormat::Format16_16:
+    case DataFormat::Format16_16_16_16:
+        return is_norm_or_int || num_format == NumberFormat::Float;
+    case DataFormat::Format32:
+    case DataFormat::Format32_32:
+    case DataFormat::Format32_32_32:
+    case DataFormat::Format32_32_32_32:
+        return is_int || num_format == NumberFormat::Float;
+    default:
+        return false;
+    }
 }
 
 static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
@@ -189,6 +219,16 @@ static void StoreBufferFormat(IR::IREmitter& ir, const IR::Value handle, const I
     }
 }
 
+/// Loads read zero and stores are dropped.
+static void LowerAsNullBuffer(IR::IREmitter& ir, IR::Inst& inst) {
+    if (IsBufferFormatLoad(inst)) {
+        inst.ReplaceUsesWithAndRemove(
+            ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
+    } else {
+        inst.Invalidate();
+    }
+}
+
 static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto flags = inst.Flags<IR::BufferInstInfo>();
@@ -214,12 +254,18 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
 
     if (data_format == AmdGpu::DataFormat::FormatInvalid) {
         LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
-        if (IsBufferFormatLoad(inst)) {
-            inst.ReplaceUsesWithAndRemove(
-                ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
-        } else {
-            inst.Invalidate();
-        }
+        LowerAsNullBuffer(ir, inst);
+        return;
+    }
+    if (!IsLowerableFormat(data_format, format_info.num_format)) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            LOG_WARNING(Render_Recompiler,
+                        "Buffer format {} with number format {} cannot be lowered, treating the "
+                        "V# as a null buffer",
+                        u32(data_format), u32(format_info.num_format));
+        });
+        LowerAsNullBuffer(ir, inst);
         return;
     }
 

@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 
@@ -63,22 +64,28 @@ static void EmitBarrierAtBlockStart(IR::Block* block) {
     ir.Barrier();
 }
 
-static bool IsDivergent(const IR::U1& cond) {
-    return IR::BreadthFirstSearch(cond, [](IR::Inst* inst) -> std::optional<bool> {
-               if (inst->GetOpcode() == IR::Opcode::GetAttributeU32 &&
-                   inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationId) {
-                   return true;
-               }
-               return std::nullopt;
-           }) == true;
+static bool IsDivergent(const IR::U1& cond, const NodeSet& uniform_readlane_blocks) {
+    const auto is_divergent = [](const IR::Inst* inst) -> std::optional<bool> {
+        if (inst->GetOpcode() == IR::Opcode::GetAttributeU32 &&
+            inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationId) {
+            return true;
+        }
+        return std::nullopt;
+    };
+    const auto is_uniform_readlane = [&](const IR::Inst* inst) {
+        return inst->GetOpcode() == IR::Opcode::ReadLane && inst->Arg(1).IsImmediate() &&
+               uniform_readlane_blocks.contains(inst->GetParent());
+    };
+    return IR::BreadthFirstSearch(cond, is_divergent, is_uniform_readlane) == true;
 }
 
 // Inserts a barrier after divergent conditional blocks to avoid undefined
 // behavior when some threads write and others read from shared memory.
 static void EmitBarrierInMergeBlock(const IR::AbstractSyntaxNode::Data& data,
-                                    NodeSet& divergence_end, u32& divergence_depth) {
+                                    NodeSet& divergence_end, u32& divergence_depth,
+                                    const NodeSet& uniform_readlane_blocks) {
     const IR::U1 cond = data.if_node.cond;
-    if (IsDivergent(cond)) {
+    if (IsDivergent(cond, uniform_readlane_blocks)) {
         if (divergence_depth == 0) {
             EmitBarrierAtBlockStart(data.if_node.merge);
         }
@@ -89,17 +96,18 @@ static void EmitBarrierInMergeBlock(const IR::AbstractSyntaxNode::Data& data,
 
 // A barrier inside a loop is invalid when different invocations leave on different iterations.
 // Mark such loops so their shared-memory synchronization can be deferred to the merge block.
-static NodeSet FindDivergentLoops(const IR::AbstractSyntaxList& syntax_list) {
+static NodeSet FindDivergentLoops(const IR::AbstractSyntaxList& syntax_list,
+                                  const NodeSet& uniform_readlane_blocks) {
     NodeSet divergent_loops;
     for (const IR::AbstractSyntaxNode& node : syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Repeat:
-            if (IsDivergent(node.data.repeat.cond)) {
+            if (IsDivergent(node.data.repeat.cond, uniform_readlane_blocks)) {
                 divergent_loops.emplace(node.data.repeat.merge);
             }
             break;
         case IR::AbstractSyntaxNode::Type::Break:
-            if (IsDivergent(node.data.break_node.cond)) {
+            if (IsDivergent(node.data.break_node.cond, uniform_readlane_blocks)) {
                 divergent_loops.emplace(node.data.break_node.merge);
             }
             break;
@@ -122,15 +130,24 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     const u32 threadgroup_size =
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup.
-    if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
+    // subgroup. Larger groups get them too for their single-wave LDS reductions.
+    const bool large_group =
+        threadgroup_size > GcnSubgroupSize && profile.lds_barriers_large_groups;
+    if (shared_memory_size == 0 || (threadgroup_size != GcnSubgroupSize && !large_group) ||
         !profile.needs_lds_barriers) {
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;
+    // ReadLanes the wave64 lowering exchanges through LDS are uniform only within their wave
+    NodeSet uniform_readlane_blocks;
+    if (profile.lds_barrier_uniform_readlane && !large_group) {
+        const auto blocks = FindWave64UniformBlocks(program);
+        uniform_readlane_blocks.insert(blocks.begin(), blocks.end());
+    }
     u32 divergence_depth{};
     NodeSet divergence_end;
-    const NodeSet divergent_loops = FindDivergentLoops(program.syntax_list);
+    const NodeSet divergent_loops =
+        FindDivergentLoops(program.syntax_list, uniform_readlane_blocks);
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         if (node.type == Type::EndIf) {
             if (divergence_end.contains(node.data.end_if.merge)) {
@@ -141,7 +158,8 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
         // Check if branch depth is zero, we don't want to insert barrier in potentially divergent
         // code.
         if (node.type == Type::If) {
-            EmitBarrierInMergeBlock(node.data, divergence_end, divergence_depth);
+            EmitBarrierInMergeBlock(node.data, divergence_end, divergence_depth,
+                                    uniform_readlane_blocks);
             continue;
         }
         if (node.type == Type::Loop && divergent_loops.contains(node.data.loop.merge)) {
@@ -156,7 +174,7 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
             }
             continue;
         }
-        if (node.type == Type::Block && divergence_depth == 0) {
+        if (node.type == Type::Block && divergence_depth == 0 && !large_group) {
             EmitBarrierInBlock(node.data.block);
         }
     }

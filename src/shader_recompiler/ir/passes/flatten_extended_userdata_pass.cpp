@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -13,11 +14,13 @@
 #include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "shader_recompiler/ir/passes/srt.h"
+#include "shader_recompiler/ir/passes/srt_walker_cache.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/ir/srt_gvn_table.h"
@@ -31,6 +34,223 @@ static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
 
 namespace Shader {
+
+// Walkers read guest memory through helpers that download pending GPU data instead of faulting
+
+/// Pages of the memory tracker and of g_walker_page_cache.
+constexpr u64 PageBits = 12;
+constexpr u64 PageSize = 1ULL << PageBits;
+constexpr u64 BackingPageSize = Core::AddressSpace::BackingPageSize;
+
+/// Entries of the load helper table, the walker's third argument (kept in r9).
+enum WalkerHelper : u32 {
+    Load64,
+    Load32,
+    LoadBlock,
+    NumWalkerHelpers,
+};
+
+static WalkerMemoryCallbacks g_walker_memory{};
+
+void SetWalkerMemoryCallbacks(const WalkerMemoryCallbacks& callbacks) {
+    g_walker_memory = callbacks;
+}
+
+static bool FitsInPage(u64 addr, u64 size, u64 page_size) {
+    return (addr & (page_size - 1)) + size <= page_size;
+}
+
+static u8* BackingAddress(u64 addr) {
+    return Core::Memory::Instance()->GetAddressSpace().BackingAddress(addr);
+}
+
+/// Downloads pending GPU data of the range. Returns whether its page is tracked.
+static bool PrepareWalkerRead(u64 addr, u64 size) {
+    const auto& cb = g_walker_memory;
+    if (!cb.read_protected) {
+        return true;
+    }
+
+    const bool tracked = cb.read_protected(addr, size);
+    if (tracked && !cb.cpu_valid(addr, size)) {
+        cb.download(addr, size);
+    }
+    return tracked;
+}
+
+void SyncGuestRead(u64 addr, u64 size) {
+    PrepareWalkerRead(addr, size);
+}
+
+static void CacheWalkerPage(u64 addr, u64 size, bool tracked, const u8* host) {
+    if (!tracked && FitsInPage(addr, size, PageSize)) {
+        g_walker_page_cache.Set(addr >> PageBits, host - (addr & (PageSize - 1)));
+    }
+}
+
+/// Loads 4 or 8 bytes. Unbacked memory (garbage pointers) reads as zero.
+static u64 WalkerGuestRead(u64 addr, u64 size) {
+    const bool tracked = PrepareWalkerRead(addr, size);
+    u64 value = 0;
+    if (!FitsInPage(addr, size, BackingPageSize)) {
+        Core::Memory::Instance()->CopySparseMemory(addr, reinterpret_cast<u8*>(&value), size);
+        return value;
+    }
+
+    const u8* host = BackingAddress(addr);
+    if (!host) {
+        return 0;
+    }
+
+    CacheWalkerPage(addr, size, tracked, host);
+    if (size == 8) {
+        std::memcpy(&value, host, 8);
+    } else {
+        std::memcpy(&value, host, 4);
+    }
+    return value;
+}
+
+/// Host address of a run of dwords in a single backing page, or 0.
+static u64 WalkerGuestBlock(u64 addr, u64 size) {
+    if (!FitsInPage(addr, size, BackingPageSize)) {
+        return 0;
+    }
+
+    const bool tracked = PrepareWalkerRead(addr, size);
+    u8* host = BackingAddress(addr);
+    if (!host) {
+        return 0;
+    }
+
+    CacheWalkerPage(addr, size, tracked, host);
+    return reinterpret_cast<u64>(host);
+}
+
+// Load helpers: address in r11, result in r11 (zero extended), other registers preserved.
+// LoadBlock also takes the size in bytes in r10 and returns a host pointer or 0.
+static Xbyak::CodeGenerator g_walker_thunks(4_KB);
+static const void* g_walker_helpers[NumWalkerHelpers] = {};
+
+const void* GetWalkerLoadHelpers() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        auto& t = g_walker_thunks;
+#ifdef _WIN32
+        const auto& arg0 = rcx;
+        const auto& arg1 = rdx;
+#else
+        const auto& arg0 = rdi;
+        const auto& arg1 = rsi;
+#endif
+        using Entry = WalkerPageCache::Entry;
+        constexpr u32 EntryShift = 4;
+        static_assert(sizeof(Entry) == 1u << EntryShift);
+        constexpr u32 PageOffsetMask = PageSize - 1;
+        constexpr u32 Win64ShadowSpace = 32;
+        // Win64 shadow space plus a saved rsp slot, 16-byte aligned
+        constexpr u32 CallFrameSize = Win64ShadowSpace + 16;
+
+        // rax = the cache entry of the page of r11; jumps to miss when that page is not cached.
+        const auto emit_lookup = [&](Xbyak::Label& miss) {
+            t.push(rax);
+            t.push(rcx);
+            t.push(rdx);
+            t.mov(rcx, r11);
+            t.shr(rcx, PageBits);
+            t.mov(edx, ecx);
+            t.and_(edx, WalkerPageCache::NumEntries - 1);
+            t.shl(edx, EntryShift);
+            t.mov(rax, reinterpret_cast<u64>(&g_walker_page_cache));
+            t.add(rax, rdx);
+            t.cmp(rcx, qword[rax + offsetof(Entry, page)]);
+            t.jne(miss);
+        };
+        const auto emit_hit_return = [&] {
+            t.pop(rdx);
+            t.pop(rcx);
+            t.pop(rax);
+            t.ret();
+        };
+        // r11 = fn(r11, second argument), every other register preserved.
+        const auto emit_slow_call = [&](Xbyak::Label& miss, const void* fn, auto&& load_arg1) {
+            t.L(miss);
+            t.pop(rdx);
+            t.pop(rcx);
+            t.pop(rax);
+            t.push(rax);
+            t.push(rcx);
+            t.push(rdx);
+            t.push(rsi);
+            t.push(rdi);
+            t.push(r8);
+            t.push(r9);
+            t.push(r10);
+            t.mov(rax, rsp);
+            t.and_(rsp, -16);
+            t.sub(rsp, CallFrameSize);
+            t.mov(ptr[rsp + Win64ShadowSpace], rax);
+            load_arg1(arg1);
+            t.mov(arg0, r11);
+            t.mov(rax, reinterpret_cast<u64>(fn));
+            t.call(rax);
+            t.mov(r11, rax);
+            t.mov(rsp, ptr[rsp + Win64ShadowSpace]);
+            t.pop(r10);
+            t.pop(r9);
+            t.pop(r8);
+            t.pop(rdi);
+            t.pop(rsi);
+            t.pop(rdx);
+            t.pop(rcx);
+            t.pop(rax);
+            t.ret();
+        };
+        // rcx = host address of r11 in the cached page at rax.
+        const auto emit_host_address = [&] {
+            t.mov(ecx, r11d);
+            t.and_(ecx, PageOffsetMask);
+            t.add(rcx, qword[rax + offsetof(Entry, backing)]);
+        };
+        const auto emit_load = [&](u32 size) -> const void* {
+            const void* entry = t.getCurr();
+            Xbyak::Label miss;
+            emit_lookup(miss);
+            t.mov(ecx, r11d);
+            t.and_(ecx, PageOffsetMask);
+            t.cmp(ecx, PageSize - size);
+            t.ja(miss); // crosses the page
+            emit_host_address();
+            if (size == 8) {
+                t.mov(r11, qword[rcx]);
+            } else {
+                t.mov(r11d, dword[rcx]);
+            }
+            emit_hit_return();
+            emit_slow_call(miss, reinterpret_cast<const void*>(&WalkerGuestRead),
+                           [&](const Xbyak::Reg64& reg) { t.mov(reg, size); });
+            return entry;
+        };
+        g_walker_helpers[Load64] = emit_load(8);
+        g_walker_helpers[Load32] = emit_load(4);
+
+        g_walker_helpers[LoadBlock] = t.getCurr();
+        Xbyak::Label miss;
+        emit_lookup(miss);
+        t.mov(ecx, r11d);
+        t.and_(ecx, PageOffsetMask);
+        t.add(ecx, r10d);
+        t.cmp(ecx, PageSize);
+        t.ja(miss); // crosses the page
+        emit_host_address();
+        t.mov(r11, rcx);
+        emit_hit_return();
+        emit_slow_call(miss, reinterpret_cast<const void*>(&WalkerGuestBlock),
+                       [&](const Xbyak::Reg64& reg) { t.mov(reg, r10); });
+        t.ready();
+    });
+    return g_walker_helpers;
+}
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
@@ -169,6 +389,9 @@ struct PassInfo {
 
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
+
+    // Number of pointers followed to reach the table being visited (0: user data).
+    u32 ptr_depth = 0;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
@@ -566,15 +789,56 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
     }
 }
 
+/// r11 = the guest value at addr, read through the load helper table in r9.
+static void EmitGuestLoad(Xbyak::CodeGenerator& c, WalkerHelper helper, const Xbyak::RegExp& addr) {
+    c.lea(r11, ptr[addr]);
+    c.call(ptr[r9 + helper * sizeof(void*)]);
+}
+
+/// Copies count dwords of the table in rdi to the flat buffer with one LoadBlock call if possible.
+static void EmitDwordRunCopy(Xbyak::CodeGenerator& c, u32 first_dw, u32 count, u32 dst_dw) {
+    Xbyak::Label per_dword, done;
+    c.lea(r11, ptr[rdi + (first_dw << 2)]);
+    c.mov(r10d, count * sizeof(u32));
+    c.call(ptr[r9 + LoadBlock * sizeof(void*)]);
+    c.test(r11, r11);
+    c.jz(per_dword, Xbyak::CodeGenerator::T_NEAR);
+
+    for (u32 k = 0; k < count; ++k) {
+        c.mov(r10d, dword[r11 + k * sizeof(u32)]);
+        c.mov(ptr[rsi + ((dst_dw + k) << 2)], r10d);
+    }
+
+    c.jmp(done, Xbyak::CodeGenerator::T_NEAR);
+    c.L(per_dword);
+
+    for (u32 k = 0; k < count; ++k) {
+        EmitGuestLoad(c, Load32, rdi + ((first_dw + k) << 2));
+        c.mov(ptr[rsi + ((dst_dw + k) << 2)], r11d);
+    }
+    c.L(done);
+}
+
 static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw) {
+    // On failure, nothing may stay emitted: a lone `push rdi` would unbalance the walker's stack.
+    const size_t rewind = c.getSize();
     c.push(rdi);
-    if (off_dw.IsImmediate()) {
-        c.mov(rdi, ptr[rdi + (off_dw.U32() << 2)]);
-    } else {
-        ABORT_ON_FAILURE(ComputeOffset(c, r10d, pass_info, off_dw));
+    if (!off_dw.IsImmediate()) {
+        if (!ComputeOffset(c, r10d, pass_info, off_dw)) {
+            c.setSize(rewind);
+            return false;
+        }
         c.shl(r10d, 2);
         c.mov(r10d, r10d);
-        c.mov(rdi, ptr[rdi + r10]);
+    }
+    const Xbyak::RegExp entry = off_dw.IsImmediate() ? rdi + (off_dw.U32() << 2) : rdi + r10;
+    const bool from_user_data = pass_info.ptr_depth == 0;
+
+    if (from_user_data) {
+        c.mov(rdi, ptr[entry]);
+    } else {
+        EmitGuestLoad(c, Load64, entry);
+        c.mov(rdi, r11);
     }
     c.mov(r10, 0xFFFFFFFFFFFFULL);
     c.and_(rdi, r10);
@@ -597,30 +861,60 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
         return;
     }
+    ++pass_info.ptr_depth;
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
     ASSERT(use_list);
 
     // First copy all the src data from this tree level
     // That way, all data that was contiguous in the guest SRT is also contiguous in the
     // flattened buffer.
-    // TODO src and dst are contiguous. Optimize with wider loads/stores
     // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
-    for (auto [src_off_dw, use] : *use_list) {
+    const auto assign_flatbuf = [&](IR::Inst* use) {
+        SetFlatbufOffset(use, pass_info.dst_off_dw);
+        pass_info.dst_off_dw++;
+    };
+    // Immediate offsets come first and sorted: runs of consecutive ones are copied together
+    const auto& uses = *use_list;
+    const auto run_length = [&](size_t i) {
+        constexpr size_t MaxRunDwords = 64;
+        size_t length = 1;
+        while (i + length < uses.size() && length < MaxRunDwords &&
+               uses.nth(i + length)->first.IsImmediate() &&
+               uses.nth(i + length)->first.U32() == uses.nth(i)->first.U32() + length) {
+            ++length;
+        }
+        return length;
+    };
+    for (size_t i = 0; i < uses.size();) {
+        const auto [src_off_dw, use] = *uses.nth(i);
         if (src_off_dw.IsImmediate()) {
-            c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
+            const size_t length = run_length(i);
+            if (length > 1) {
+                EmitDwordRunCopy(c, src_off_dw.U32(), static_cast<u32>(length),
+                                 pass_info.dst_off_dw);
+                for (size_t k = 0; k < length; ++k) {
+                    assign_flatbuf(uses.nth(i + k)->second);
+                }
+                i += length;
+                continue;
+            }
+        }
+        ++i;
+        if (src_off_dw.IsImmediate()) {
+            EmitGuestLoad(c, Load32, rdi + (src_off_dw.U32() << 2));
         } else {
+            const size_t rewind = c.getSize();
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
+                c.setSize(rewind);
                 LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
                 continue;
             }
             c.shl(r10d, 2);
             c.mov(r10d, r10d);
-            c.mov(r10d, dword[rdi + r10]);
+            EmitGuestLoad(c, Load32, rdi + r10);
         }
-        c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
-
-        SetFlatbufOffset(use, pass_info.dst_off_dw);
-        pass_info.dst_off_dw++;
+        c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r11d);
+        assign_flatbuf(use);
     }
 
     // Then visit any children used as pointers
@@ -630,6 +924,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         }
     }
 
+    --pass_info.ptr_depth;
     PopPtr(c);
 }
 
@@ -650,6 +945,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
+    c.mov(r9, rdx); // load helper table (third argument)
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
@@ -868,6 +1164,14 @@ namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
+}
+
+void SetWalkerMemoryCallbacks(const WalkerMemoryCallbacks&) {}
+
+void SyncGuestRead(u64, u64) {}
+
+const void* GetWalkerLoadHelpers() {
+    return nullptr;
 }
 
 namespace Optimization {

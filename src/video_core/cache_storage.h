@@ -8,7 +8,9 @@
 #include "common/types.h"
 
 #include <functional>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Storage {
@@ -41,7 +43,13 @@ public:
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
+    u32 AllocateShaderBinaryIndex(u64 pgm_hash, u32 min_index);
+
 private:
+    void ScanShaderBinaryIndices();
+
+    std::mutex index_mutex{};
+    std::unordered_map<u64, u32> next_binary_index{}; ///< next free index of each program
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
     bool opened{};

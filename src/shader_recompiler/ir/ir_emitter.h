@@ -371,6 +371,8 @@ public:
 
     [[nodiscard]] Value ImageHandle(const Value& tsharp_low, const Value& tsharp_high);
 
+    [[nodiscard]] Value ImageArrayHandle(const U32& handle, const U32& element);
+
     [[nodiscard]] Value ImageSampleRaw(const Value& handle, const Value& sampler_handle,
                                        const Value& address1, const Value& address2,
                                        const Value& address3, const Value& address4,

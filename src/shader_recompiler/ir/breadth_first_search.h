@@ -13,9 +13,9 @@
 namespace Shader::IR {
 
 // Use typename Instruction so the function can be used to return either const or mutable
-// Insts depending on the context.
-template <typename Instruction, typename Pred>
-auto BreadthFirstSearch(Instruction* inst, Pred&& pred)
+// Insts depending on the context. Arguments of the instructions skip accepts are not searched.
+template <typename Instruction, typename Pred, typename Skip>
+auto BreadthFirstSearch(Instruction* inst, Pred&& pred, Skip&& skip)
     -> std::invoke_result_t<Pred, Instruction*> {
     // Most often case the instruction is the desired already.
     if (std::optional result = pred(inst)) {
@@ -35,6 +35,9 @@ auto BreadthFirstSearch(Instruction* inst, Pred&& pred)
             // This is the instruction we were looking for
             return result;
         }
+        if (skip(inst)) {
+            continue;
+        }
         // Visit the right most arguments first
         for (size_t arg = inst->NumArgs(); arg--;) {
             Value arg_value{inst->Arg(arg)};
@@ -53,6 +56,12 @@ auto BreadthFirstSearch(Instruction* inst, Pred&& pred)
     return std::nullopt;
 }
 
+template <typename Instruction, typename Pred>
+auto BreadthFirstSearch(Instruction* inst, Pred&& pred)
+    -> std::invoke_result_t<Pred, Instruction*> {
+    return BreadthFirstSearch(inst, pred, [](Instruction*) { return false; });
+}
+
 template <typename Pred>
 auto BreadthFirstSearch(const Value& value, Pred&& pred)
     -> std::invoke_result_t<Pred, const Inst*> {
@@ -61,6 +70,16 @@ auto BreadthFirstSearch(const Value& value, Pred&& pred)
         return std::nullopt;
     }
     return BreadthFirstSearch(value.Inst(), pred);
+}
+
+template <typename Pred, typename Skip>
+auto BreadthFirstSearch(const Value& value, Pred&& pred, Skip&& skip)
+    -> std::invoke_result_t<Pred, const Inst*> {
+    if (value.IsImmediate()) {
+        // Nothing to do with immediates
+        return std::nullopt;
+    }
+    return BreadthFirstSearch(value.Inst(), pred, skip);
 }
 
 template <typename Pred>

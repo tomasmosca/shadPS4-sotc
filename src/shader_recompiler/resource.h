@@ -16,6 +16,8 @@ static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
 static constexpr u32 NUM_FMASKS = 8;
+static constexpr u32 MAX_TSHARP_ARRAY_SIZE = 64;
+static constexpr u32 NUM_IMAGE_ARRAY_DESCRIPTORS = 2 * (MAX_TSHARP_ARRAY_SIZE + 1);
 
 using SharpLocation = u16;
 
@@ -39,11 +41,12 @@ struct SharpFetch {
 
     bool operator==(const SharpFetch&) const = default;
 
+    /// element_off_dw selects an element of a sharp table (see SharpTable)
     template <u32 num_dwords = N>
         requires(num_dwords <= N)
-    constexpr bool Fetch(const u32* flatbuf, T* out) const {
+    constexpr bool Fetch(const u32* flatbuf, T* out, u32 element_off_dw = 0) const {
         if (summary == Summary::SingleLoad) [[likely]] {
-            std::memcpy(out, flatbuf + offsets[0], num_dwords * sizeof(u32));
+            std::memcpy(out, flatbuf + offsets[0] + element_off_dw, num_dwords * sizeof(u32));
             return true;
         } else if (summary == Summary::Invalid) [[unlikely]] {
             return false;
@@ -51,13 +54,28 @@ struct SharpFetch {
         u8 mask = load_mask;
         std::array<u32, num_dwords> out_dw;
         for (u32 i = 0; i < num_dwords; i++) {
-            out_dw[i] = (mask & 1) ? flatbuf[offsets[i]] : immediates[i];
+            out_dw[i] = (mask & 1) ? flatbuf[offsets[i] + element_off_dw] : immediates[i];
             mask >>= 1;
         }
         std::memcpy(out, out_dw.data(), sizeof(out_dw));
         return true;
     }
 };
+
+/// Sharps indexed at runtime, copied on every refresh: element i to flatbuf_off + i * stride_dw
+struct SharpTable {
+    SharpLocation ptr_lo{};
+    SharpLocation ptr_hi{};
+    SharpLocation flatbuf_off{};
+    u16 num_elements{};
+    u32 offset_dw{};
+    u32 stride_dw{};
+
+    u32 NumDwords() const noexcept {
+        return num_elements * stride_dw;
+    }
+};
+using SharpTableList = boost::container::static_vector<SharpTable, 4>;
 
 enum class SharpFetchPostOp : u8 {
     None,
@@ -130,10 +148,27 @@ struct ImageResource {
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
+    u16 array_size{};
+    u16 array_stride_dw{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
+        if (array_size == 0) {
+            return GetElementSharp(info, 0);
+        }
+
+        for (u32 i = 0; i < array_size; ++i) {
+            const AmdGpu::Image image = GetElementSharp(info, i);
+            if (image) {
+                return image;
+            }
+        }
+
+        return AmdGpu::Image::Null(is_depth);
+    }
+
+    constexpr AmdGpu::Image GetElementSharp(const auto& info, u32 element) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.flattened_ud_buf.data(), &image)) {
+        if (!Fetch(info.flattened_ud_buf.data(), &image, element * array_stride_dw)) {
             return AmdGpu::Image::Null(is_depth);
         }
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
@@ -152,13 +187,13 @@ struct ImageResource {
         return image;
     }
 
-    constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out) const {
+    constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out, u32 element_off_dw = 0) const {
         if (!is_r128) {
             // Fetch full 8 byte T#
-            return sharp_fetch.Fetch(flatbuf, out);
+            return sharp_fetch.Fetch(flatbuf, out, element_off_dw);
         }
         // Fetch r128 T# and fix pitch
-        if (!sharp_fetch.Fetch<4>(flatbuf, out)) {
+        if (!sharp_fetch.Fetch<4>(flatbuf, out, element_off_dw)) {
             return false;
         }
         out->pitch = out->width;
@@ -166,9 +201,18 @@ struct ImageResource {
     }
 
     u32 NumBindings(const auto& info) const {
+        if (array_size != 0) {
+            return array_size + 1u;
+        }
+
+        if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex) {
+            return 1;
+        }
+
         const AmdGpu::Image tsharp = GetSharp(info);
-        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
-                   ? (tsharp.last_level - tsharp.base_level + 1)
+        // A garbage T# can have last_level < base_level; the difference would wrap around
+        return tsharp.last_level >= tsharp.base_level
+                   ? u32(tsharp.last_level) - u32(tsharp.base_level) + 1
                    : 1;
     }
 };

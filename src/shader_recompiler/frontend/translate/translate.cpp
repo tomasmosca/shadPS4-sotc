@@ -110,10 +110,19 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                             ir.GetAttributeU32(IR::Attribute::BaseInstance));
         }
 
+        // The GCN instance ID starts at 0 in every draw, gl_InstanceIndex at firstInstance
+        const auto relative_instance_id = [&] {
+            IR::U32 id = ir.GetAttributeU32(IR::Attribute::InstanceId);
+            if (profile.relative_instance_id) {
+                id = ir.ISub(id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+            }
+            return id;
+        };
+
         // v0: vertex ID, always present
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
         if (base_vertex_sgpr != -1) {
-            if (!fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
+            if (fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
                 vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
             } else {
                 ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
@@ -135,9 +144,8 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             // v1: instance ID, step rate 0
             if (runtime_info.props.num_input_vgprs > 0) {
                 if (runtime_info.sw.vs.step_rate_0 != 0) {
-                    ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
-                                            ir.Imm32(runtime_info.sw.vs.step_rate_0)));
+                    ir.SetVectorReg(dst_vreg++, ir.IDiv(relative_instance_id(),
+                                                        ir.Imm32(runtime_info.sw.vs.step_rate_0)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -145,9 +153,8 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             // v2: instance ID, step rate 1
             if (runtime_info.props.num_input_vgprs > 1) {
                 if (runtime_info.sw.vs.step_rate_1 != 0) {
-                    ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
-                                            ir.Imm32(runtime_info.sw.vs.step_rate_1)));
+                    ir.SetVectorReg(dst_vreg++, ir.IDiv(relative_instance_id(),
+                                                        ir.Imm32(runtime_info.sw.vs.step_rate_1)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -158,13 +165,15 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         if (runtime_info.props.num_input_vgprs > 2) {
             IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
             if (base_instance_sgpr != -1) {
-                if (!fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
+                if (fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
                     instance_id =
                         ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
                 } else {
                     ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
                                "Fetch shader in indirect draw uses wrong base instance");
                 }
+            } else if (profile.relative_instance_id) {
+                instance_id = relative_instance_id();
             }
             ir.SetVectorReg(dst_vreg++, instance_id);
         }
@@ -1189,6 +1198,10 @@ void Translator::EmitFetch(const GcnInst& inst) {
         for (u32 i = 0; i < attrib.num_elements; i++) {
             ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(swizzled, i)});
         }
+    }
+
+    for (const u8 vgpr : fetch_data.one_vgprs) {
+        ir.SetVectorReg(IR::VectorReg(vgpr), ir.Imm32(1.f));
     }
 }
 
