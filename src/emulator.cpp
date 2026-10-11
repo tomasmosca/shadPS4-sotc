@@ -495,6 +495,30 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU userfaultfdTracking: {}", EmulatorSettings.IsUserfaultfdTracking());
 #endif
     LOG_INFO(Config, "GPU inlineFetchShader: {}", EmulatorSettings.IsInlineFetchShader());
+    LOG_INFO(Config, "GPU earlyFragmentTestsFromZOrder: {}",
+             EmulatorSettings.IsEarlyFragmentTestsFromZOrder());
+    LOG_INFO(Config, "GPU lodStatsFromBindings: {}", EmulatorSettings.IsLodStatsFromBindings());
+    LOG_INFO(Config, "GPU dynamicTsharpArraySize: {}",
+             EmulatorSettings.GetDynamicTsharpArraySize());
+    LOG_INFO(Config, "GPU wave64UniformBranches: {}", EmulatorSettings.IsWave64UniformBranches());
+    LOG_INFO(Config, "GPU wave64MissingLaneIdentity: {}",
+             EmulatorSettings.IsWave64MissingLaneIdentity());
+    LOG_INFO(Config, "GPU ldsBarriersLargeGroups: {}", EmulatorSettings.IsLdsBarriersLargeGroups());
+    LOG_INFO(Config, "GPU ldsBarrierUniformReadlane: {}",
+             EmulatorSettings.IsLdsBarrierUniformReadlane());
+    LOG_INFO(Config, "GPU recordThread: {}", EmulatorSettings.IsRecordThread());
+    LOG_INFO(Config, "GPU flushEveryDraws: {}", EmulatorSettings.GetFlushEveryDraws());
+    LOG_INFO(Config, "GPU shaderLoopCap: {}", EmulatorSettings.GetShaderLoopCap());
+    LOG_INFO(Config, "GPU copyKernelHle: {}", EmulatorSettings.IsCopyKernelHle());
+    LOG_INFO(Config, "GPU eagerReadbacks: {}", EmulatorSettings.IsEagerReadbacks());
+    LOG_INFO(Config, "GPU readbacksAhead: {}", EmulatorSettings.IsReadbacksAhead());
+    LOG_INFO(Config, "GPU streamUploadDedup: {}", EmulatorSettings.IsStreamUploadDedup());
+    LOG_INFO(Config, "GPU specializationMemo: {}", EmulatorSettings.IsSpecializationMemo());
+    LOG_INFO(Config, "GPU reuseDrawState: {}", EmulatorSettings.IsReuseDrawState());
+    LOG_INFO(Config, "GPU eopLabelsAfterGpu: {}", EmulatorSettings.IsEopLabelsAfterGpu());
+    LOG_INFO(Config, "GPU eopAfterEarlierCompute: {}", EmulatorSettings.IsEopAfterEarlierCompute());
+    LOG_INFO(Config, "GPU nanAwareMinMax: {}", EmulatorSettings.IsNanAwareMinMax());
+    LOG_INFO(Config, "GPU relativeInstanceId: {}", EmulatorSettings.IsRelativeInstanceId());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
     LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
     LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());

@@ -414,6 +414,26 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    Setting<bool> early_fragment_tests_from_z_order{true};
+    Setting<bool> lod_stats_from_bindings{true};
+    Setting<u32> dynamic_tsharp_array_size{16};
+    Setting<bool> wave64_uniform_branches{true};
+    Setting<bool> wave64_missing_lane_identity{true};
+    Setting<bool> lds_barriers_large_groups{true};
+    Setting<bool> lds_barrier_uniform_readlane{true};
+    Setting<bool> record_thread{true};
+    Setting<u32> flush_every_draws{64};
+    Setting<u32> shader_loop_cap{0};
+    Setting<bool> copy_kernel_hle{true};
+    Setting<bool> eager_readbacks{true};
+    Setting<bool> readbacks_ahead{true};
+    Setting<bool> stream_upload_dedup{true};
+    Setting<bool> specialization_memo{true};
+    Setting<bool> reuse_draw_state{true};
+    Setting<bool> eop_labels_after_gpu{true};
+    Setting<bool> eop_after_earlier_compute{true};
+    Setting<bool> nan_aware_min_max{true};
+    Setting<bool> relative_instance_id{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -438,16 +458,48 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("early_fragment_tests_from_z_order",
+                                       &GPUSettings::early_fragment_tests_from_z_order),
+            make_override<GPUSettings>("lod_stats_from_bindings",
+                                       &GPUSettings::lod_stats_from_bindings),
+            make_override<GPUSettings>("dynamic_tsharp_array_size",
+                                       &GPUSettings::dynamic_tsharp_array_size),
+            make_override<GPUSettings>("wave64_uniform_branches",
+                                       &GPUSettings::wave64_uniform_branches),
+            make_override<GPUSettings>("wave64_missing_lane_identity",
+                                       &GPUSettings::wave64_missing_lane_identity),
+            make_override<GPUSettings>("lds_barriers_large_groups",
+                                       &GPUSettings::lds_barriers_large_groups),
+            make_override<GPUSettings>("lds_barrier_uniform_readlane",
+                                       &GPUSettings::lds_barrier_uniform_readlane),
+            make_override<GPUSettings>("record_thread", &GPUSettings::record_thread),
+            make_override<GPUSettings>("flush_every_draws", &GPUSettings::flush_every_draws),
+            make_override<GPUSettings>("shader_loop_cap", &GPUSettings::shader_loop_cap),
+            make_override<GPUSettings>("copy_kernel_hle", &GPUSettings::copy_kernel_hle),
+            make_override<GPUSettings>("eager_readbacks", &GPUSettings::eager_readbacks),
+            make_override<GPUSettings>("readbacks_ahead", &GPUSettings::readbacks_ahead),
+            make_override<GPUSettings>("stream_upload_dedup", &GPUSettings::stream_upload_dedup),
+            make_override<GPUSettings>("specialization_memo", &GPUSettings::specialization_memo),
+            make_override<GPUSettings>("reuse_draw_state", &GPUSettings::reuse_draw_state),
+            make_override<GPUSettings>("eop_labels_after_gpu", &GPUSettings::eop_labels_after_gpu),
+            make_override<GPUSettings>("eop_after_earlier_compute",
+                                       &GPUSettings::eop_after_earlier_compute),
+            make_override<GPUSettings>("nan_aware_min_max", &GPUSettings::nan_aware_min_max),
+            make_override<GPUSettings>("relative_instance_id", &GPUSettings::relative_instance_id),
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
+    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
+    direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, full_screen,
+    full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+    userfaultfd, inline_fetch_shader, early_fragment_tests_from_z_order, lod_stats_from_bindings,
+    dynamic_tsharp_array_size, wave64_uniform_branches, wave64_missing_lane_identity,
+    lds_barriers_large_groups, lds_barrier_uniform_readlane, record_thread, flush_every_draws,
+    shader_loop_cap, copy_kernel_hle, eager_readbacks, readbacks_ahead, stream_upload_dedup,
+    specialization_memo, reuse_draw_state, eop_labels_after_gpu, eop_after_earlier_compute,
+    nan_aware_min_max, relative_instance_id)
 
 // -------------------------------
 // Vulkan settings
@@ -616,6 +668,10 @@ public:
     void Set##Name(const decltype((group).field.value)& v, bool specific = false) {                \
         (group).field.set(v, specific);                                                            \
     }
+#define SETTING_FORWARD_READONLY(group, Name, field)                                               \
+    auto Get##Name() const {                                                                       \
+        return (group).field.get(m_configMode);                                                    \
+    }
 #define SETTING_FORWARD_BOOL(group, Name, field)                                                   \
     bool Is##Name() const {                                                                        \
         return (group).field.get(m_configMode);                                                    \
@@ -716,6 +772,27 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, EarlyFragmentTestsFromZOrder,
+                                  early_fragment_tests_from_z_order)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, LodStatsFromBindings, lod_stats_from_bindings)
+    SETTING_FORWARD_READONLY(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, Wave64MissingLaneIdentity, wave64_missing_lane_identity)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, LdsBarriersLargeGroups, lds_barriers_large_groups)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, LdsBarrierUniformReadlane, lds_barrier_uniform_readlane)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, RecordThread, record_thread)
+    SETTING_FORWARD_READONLY(m_gpu, FlushEveryDraws, flush_every_draws)
+    SETTING_FORWARD_READONLY(m_gpu, ShaderLoopCap, shader_loop_cap)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, CopyKernelHle, copy_kernel_hle)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, EagerReadbacks, eager_readbacks)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, ReadbacksAhead, readbacks_ahead)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, StreamUploadDedup, stream_upload_dedup)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, SpecializationMemo, specialization_memo)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, ReuseDrawState, reuse_draw_state)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, EopLabelsAfterGpu, eop_labels_after_gpu)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, EopAfterEarlierCompute, eop_after_earlier_compute)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, NanAwareMinMax, nan_aware_min_max)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, RelativeInstanceId, relative_instance_id)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
@@ -763,6 +840,7 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, PipelineCacheArchived, pipeline_cache_archived)
 
 #undef SETTING_FORWARD
+#undef SETTING_FORWARD_READONLY
 #undef SETTING_FORWARD_BOOL
 #undef SETTING_FORWARD_BOOL_READONLY
 };
