@@ -11,7 +11,7 @@ The fork starts from upstream commit `94e2177` (September 29, 2026). It changes 
 
 ## Status
 
-On an Intel Core i5-9400F with an NVIDIA RTX 2070 (8 GB), the game runs at about 30 fps next to the shrine altar. Before the speed changes, the same scene ran at about 14 fps.
+On an Intel Core i5-9400F with an NVIDIA RTX 2070 (8 GB), the game runs at about 30 fps most of the time. Before the speed changes, the game ran at about 8 fps.
 
 Tested setup:
 
@@ -104,9 +104,7 @@ The fork adds these settings to the `GPU` section of `config.json` and of the ga
 ## Credits
 
 - The [shadPS4](https://github.com/shadps4-emu/shadPS4) team, for the emulator.
-- [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) by luizgustavs, for the graphics fixes and the Vulkan recording thread.
-- [MathieuARS](https://github.com/MathieuARS), for the DMA fault handling in [shadPS4 pull request #4738](https://github.com/shadps4-emu/shadPS4/pull/4738).
-- [AjncSystem](https://github.com/AjncSystem/ShadPS4-ShadowoftheColossus-Build-customizado-97-corrigida), for the light ray, instance ID and legacy multiplication fixes.
+- [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4), implemented various of the graphical fixes.
 
 ## License
 
