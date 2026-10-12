@@ -278,6 +278,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       specialization_memo{EmulatorSettings.IsSpecializationMemo()},
       early_fragment_tests_from_z_order{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()},
+      preload_pipelines{EmulatorSettings.IsPreloadPipelines()},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -347,13 +348,28 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     WarmUp();
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+    if (!pipeline_cache) {
+        auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+        ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+                   vk::to_string(cache_result));
+        pipeline_cache = std::move(cache);
+    }
+    if (Storage::DataBase::Instance().IsOpened()) {
+        Storage::DataBase::Instance().SetCloseHandler([this] {
+            if (preload_thread.joinable()) {
+                preload_thread.request_stop();
+                preload_thread.join();
+            }
+            SaveDriverCache();
+            SaveProgramOrder();
+        });
+    }
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    Storage::DataBase::Instance().SetCloseHandler({});
+    Storage::DataBase::Instance().WaitForSaves();
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -372,6 +388,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
+        OnPipelineCreated();
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -400,6 +417,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+        OnPipelineCreated();
 
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = modules[0];
@@ -728,6 +746,18 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    if (!program_cache.contains(params.hash)) {
+        {
+            std::scoped_lock lk{preload_mutex};
+            used_programs.push_back(params.hash);
+        }
+
+        if (!preload_pipelines) {
+            if (auto stored = TakeStoredProgram(params.hash)) {
+                program_cache.emplace(params.hash, std::move(stored));
+            }
+        }
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);

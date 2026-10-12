@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -93,6 +98,10 @@ public:
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    Program* LoadPermutation(Serialization::Archive& ar, size_t& perm_idx);
+    std::unique_ptr<Program> LoadProgram(u64 pgm_hash);
+    std::unique_ptr<Program> TakeStoredProgram(u64 pgm_hash);
+    void PreloadPrograms(std::stop_token stoken);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -130,12 +139,19 @@ private:
         return num_new_pipelines > 0;
     }
 
+    void CreateDriverCache();
+    void SaveDriverCache();
+    void OnPipelineCreated();
+    void LoadProgramOrder();
+    void SaveProgramOrder();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     const bool specialization_memo;
     const bool early_fragment_tests_from_z_order;
+    const bool preload_pipelines;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
@@ -152,11 +168,23 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    u32 pipelines_since_save{};
+    std::chrono::steady_clock::time_point last_driver_cache_save{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    std::mutex preload_mutex;
+    std::condition_variable preload_cv;
+    tsl::robin_map<u64, std::unique_ptr<Program>> preloaded_programs;
+    std::unordered_set<u64> claimed_programs;
+    u64 loading_program{};
+    bool loading_program_taken{};
+    tsl::robin_map<u64, u32> program_order;
+    std::vector<u64> used_programs;
+    std::jthread preload_thread;
 };
 
 } // namespace Vulkan

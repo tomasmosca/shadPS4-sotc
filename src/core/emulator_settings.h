@@ -434,6 +434,7 @@ struct GPUSettings {
     Setting<bool> eop_after_earlier_compute{true};
     Setting<bool> nan_aware_min_max{true};
     Setting<bool> relative_instance_id{true};
+    Setting<bool> preload_pipelines{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -486,6 +487,7 @@ struct GPUSettings {
                                        &GPUSettings::eop_after_earlier_compute),
             make_override<GPUSettings>("nan_aware_min_max", &GPUSettings::nan_aware_min_max),
             make_override<GPUSettings>("relative_instance_id", &GPUSettings::relative_instance_id),
+            make_override<GPUSettings>("preload_pipelines", &GPUSettings::preload_pipelines),
         };
     }
 };
@@ -499,7 +501,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     lds_barriers_large_groups, lds_barrier_uniform_readlane, record_thread, flush_every_draws,
     shader_loop_cap, copy_kernel_hle, eager_readbacks, readbacks_ahead, stream_upload_dedup,
     specialization_memo, reuse_draw_state, eop_labels_after_gpu, eop_after_earlier_compute,
-    nan_aware_min_max, relative_instance_id)
+    nan_aware_min_max, relative_instance_id, preload_pipelines)
 
 // -------------------------------
 // Vulkan settings
@@ -793,6 +795,7 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, EopAfterEarlierCompute, eop_after_earlier_compute)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, NanAwareMinMax, nan_aware_min_max)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, RelativeInstanceId, relative_instance_id)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, PreloadPipelines, preload_pipelines)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

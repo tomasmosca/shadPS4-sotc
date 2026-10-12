@@ -519,6 +519,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU eopAfterEarlierCompute: {}", EmulatorSettings.IsEopAfterEarlierCompute());
     LOG_INFO(Config, "GPU nanAwareMinMax: {}", EmulatorSettings.IsNanAwareMinMax());
     LOG_INFO(Config, "GPU relativeInstanceId: {}", EmulatorSettings.IsRelativeInstanceId());
+    LOG_INFO(Config, "GPU preloadPipelines: {}", EmulatorSettings.IsPreloadPipelines());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
     LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
     LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());

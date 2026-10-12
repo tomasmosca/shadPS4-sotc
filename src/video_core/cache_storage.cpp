@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
@@ -87,6 +88,12 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     case BlobType::ShaderProfile: {
         return "bin";
     }
+    case BlobType::DriverPipelineCache: {
+        return "vkc";
+    }
+    case BlobType::ProgramOrder: {
+        return "order";
+    }
     default:
         UNREACHABLE();
     }
@@ -152,6 +159,7 @@ void DataBase::ScanShaderBinaryIndices() {
 
         auto& next = next_binary_index[hash];
         next = std::max<u32>(next, static_cast<u32>(index) + 1);
+        stored_permutations[hash].push_back(static_cast<u32>(index));
     };
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -191,10 +199,50 @@ u32 DataBase::AllocateShaderBinaryIndex(u64 pgm_hash, u32 min_index) {
     return index;
 }
 
+std::vector<u64> DataBase::StoredPrograms() {
+    std::scoped_lock lk{index_mutex};
+    std::vector<u64> programs;
+    programs.reserve(stored_permutations.size());
+
+    for (const auto& [pgm_hash, _] : stored_permutations) {
+        programs.push_back(pgm_hash);
+    }
+    return programs;
+}
+
+std::vector<u32> DataBase::StoredPermutations(u64 pgm_hash) {
+    std::scoped_lock lk{index_mutex};
+    const auto it = stored_permutations.find(pgm_hash);
+
+    return it != stored_permutations.end() ? it->second : std::vector<u32>{};
+}
+
+void DataBase::SetCloseHandler(std::function<void()> handler) {
+    close_handler = std::move(handler);
+}
+
+void DataBase::WaitForSaves() {
+    while (IsOpened()) {
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (num_requests == 0) {
+                return;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
         return;
     }
+
+    if (close_handler) {
+        close_handler();
+    }
+
+    WaitForSaves();
 
     io_worker.request_stop();
     io_worker.join();
@@ -209,24 +257,39 @@ void DataBase::Close() {
 }
 
 template <typename T>
-bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
+void WriteBlob(const BlobType type, std::filesystem::path path, const std::vector<T>& v) {
+    path.replace_extension(GetBlobFileExtension(type));
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        ASSERT_MSG(!ar_is_read_only,
+                   "The archive is read-only. Did you forget to call `FinishPreload`?");
+        if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(), v.size() * sizeof(T),
+                                   MZ_BEST_COMPRESSION)) {
+            LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
+        }
+    } else {
+        using namespace Common::FS;
+        auto temp_path = path;
+        temp_path += ".tmp";
+        bool written{};
+        {
+            const auto file = IOFile{temp_path, FileAccessMode::Create};
+            written = file.IsOpen() && file.Write(v) == v.size();
+        }
+
+        std::error_code ec;
+        if (written) {
+            std::filesystem::rename(temp_path, path, ec);
+        }
+
+        if (!written || ec) {
+            std::filesystem::remove(temp_path, ec);
+            LOG_ERROR(Render, "Failed to save {}", path.string());
+        }
+    }
+}
+
+bool Enqueue(std::packaged_task<void()>&& request) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
-            path.replace_extension(GetBlobFileExtension(type));
-            if (EmulatorSettings.IsPipelineCacheArchived()) {
-                ASSERT_MSG(!ar_is_read_only,
-                           "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
-                    LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
-                }
-            } else {
-                using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
-            }
-        }};
         std::scoped_lock lock{m_request};
         req_queue.emplace(std::move(request));
     }
@@ -235,6 +298,11 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
     ++num_requests;
     request_cv.notify_one();
     return true;
+}
+
+template <typename T>
+bool WriteVector(const BlobType type, std::filesystem::path&& path, std::vector<T>&& v) {
+    return Enqueue(std::packaged_task<void()>{[=] { WriteBlob(type, path, v); }});
 }
 
 template <typename T>
@@ -277,6 +345,22 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
     return WriteVector(type, std::move(path), std::move(data));
+}
+
+bool DataBase::SaveFrom(BlobType type, const std::string& name,
+                        std::function<std::vector<u8>()> produce) {
+    if (!opened) {
+        return false;
+    }
+
+    auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
+                                                           : cache_path / name;
+
+    return Enqueue(std::packaged_task<void()>{[type, path, produce = std::move(produce)] {
+        if (const auto data = produce(); !data.empty()) {
+            WriteBlob(type, path, data);
+        }
+    }});
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& data) {
