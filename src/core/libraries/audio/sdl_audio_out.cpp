@@ -31,8 +31,6 @@ constexpr float INV_VOLUME_0DB = 1.0f / VOLUME_0DB;
 constexpr float VOLUME_EPSILON = 0.001f;
 // Timing constants
 constexpr u64 VOLUME_CHECK_INTERVAL_US = 50000; // Check every 50ms
-constexpr u64 MIN_SLEEP_THRESHOLD_US = 10;
-constexpr u64 TIMING_RESYNC_THRESHOLD_US = 100000; // Resync if >100ms behind
 
 // Queue management
 constexpr u32 QUEUE_MULTIPLIER = 4;
@@ -84,7 +82,6 @@ public:
         UpdateVolumeIfChanged();
         const u64 current_time = Kernel::sceKernelGetProcessTime();
         convert(ptr, internal_buffer, buffer_frames, nullptr);
-        HandleTiming(current_time);
 
         if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
             ManageAudioQueue();
@@ -128,6 +125,16 @@ public:
         } else {
             LOG_ERROR(Lib_AudioOut, "Failed to set audio stream gain: {}", SDL_GetError());
         }
+    }
+
+    std::optional<std::chrono::microseconds> QueuedTime() const override {
+        if (!stream) [[unlikely]] {
+            return std::nullopt;
+        }
+
+        // The port thread paces the output by this, so it replaces a timer of its own
+        const int queued = SDL_GetAudioStreamQueued(stream);
+        return std::chrono::microseconds{std::max(queued, 0) * period_us / internal_buffer_size};
     }
 
     u64 GetLastOutputTime() const {
@@ -213,34 +220,6 @@ private:
             } else {
                 LOG_ERROR(Lib_AudioOut, "Failed to set audio stream gain: {}", SDL_GetError());
             }
-        }
-    }
-
-    void HandleTiming(u64 current_time) {
-        if (next_output_time == 0) [[unlikely]] {
-            // First output - set initial timing
-            next_output_time = current_time + period_us;
-            return;
-        }
-
-        const s64 time_diff = static_cast<s64>(current_time - next_output_time);
-
-        if (time_diff > static_cast<s64>(TIMING_RESYNC_THRESHOLD_US)) [[unlikely]] {
-            // We're far behind - resync
-            next_output_time = current_time + period_us;
-        } else if (time_diff < 0) {
-            // We're ahead of schedule - wait
-            const u64 time_to_wait = static_cast<u64>(-time_diff);
-            next_output_time += period_us;
-
-            if (time_to_wait > MIN_SLEEP_THRESHOLD_US) {
-                // Sleep for most of the wait period
-                const u64 sleep_duration = time_to_wait - MIN_SLEEP_THRESHOLD_US;
-                std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
-            }
-        } else {
-            // Slightly behind or on time - just advance
-            next_output_time += period_us;
         }
     }
 
@@ -496,6 +475,10 @@ private:
         const u32 sdl_buffer_size = sdl_buffer_frames * sizeof(float) * num_channels;
         queue_threshold = std::max(guest_buffer_size, sdl_buffer_size) * QUEUE_MULTIPLIER;
 
+        const u64 target_size = internal_buffer_size * QueuedAudioTarget.count() / period_us;
+        queue_threshold =
+            std::max(queue_threshold, static_cast<u32>(target_size * QUEUE_MULTIPLIER));
+
         LOG_DEBUG(Lib_AudioOut, "Audio queue threshold: {} bytes (SDL buffer: {} frames)",
                   queue_threshold, sdl_buffer_frames);
     }
@@ -636,7 +619,6 @@ private:
 
     alignas(64) u64 period_us{0};
     alignas(64) std::atomic<u64> last_output_time{0};
-    u64 next_output_time{0};
     u64 last_volume_check_time{0};
     u32 output_count{0};
 

@@ -168,14 +168,31 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         Common::SetCurrentThreadName(thread_name.c_str());
     }
 
-    Common::AccurateTimer timer(
-        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+
+    const std::chrono::nanoseconds period{1000000000ULL * port->buffer_frames / port->sample_rate};
+    Common::AccurateTimer timer(period);
+
+    bool queue_paced{};
+    {
+        std::unique_lock lock{port->mutex};
+        queue_paced = port->impl && port->impl->QueuedTime().has_value();
+    }
 
     while (true) {
-        timer.Start();
+        if (!queue_paced) {
+            timer.Start();
+        }
 
+        std::optional<std::chrono::microseconds> queued;
         {
             std::unique_lock lock{port->mutex};
+
+            if (queue_paced) {
+                port->output_cv.wait_for(
+                    lock, period, [&] { return port->output_ready || stop.stop_requested(); });
+            }
+
             if (!port->impl || stop.stop_requested()) {
                 break;
             }
@@ -185,6 +202,10 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                 port->output_ready = false;
                 port->last_output_time =
                     Kernel::sceKernelGetProcessTime(); // moved from sceAudioOutOutput TOOD recheck
+
+                if (queue_paced) {
+                    queued = port->impl->QueuedTime();
+                }
             }
         }
 
@@ -194,7 +215,11 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             break;
         }
 
-        timer.End();
+        if (!queue_paced) {
+            timer.End();
+        } else if (queued && *queued > QueuedAudioTarget) {
+            Common::AccurateSleep(*queued - QueuedAudioTarget, nullptr, false);
+        }
     }
 
     {
@@ -585,6 +610,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
     }
+    port->output_cv.notify_all();
 
     return samples_sent;
 }
@@ -688,6 +714,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
+            ports[i]->output_cv.notify_all();
         }
     }
 
