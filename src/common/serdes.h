@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace Serialization {
@@ -58,12 +59,26 @@ struct Archive {
         return offset >= container.size();
     }
 
+    [[nodiscard]] size_t Remaining() const {
+        return container.size() - offset;
+    }
+
+    [[nodiscard]] bool Failed() const {
+        return failed;
+    }
+
+    void Fail() {
+        failed = true;
+        offset = static_cast<u32>(container.size());
+    }
+
     Archive() = default;
     explicit Archive(std::vector<u8>&& v) : container{v} {}
 
 private:
     u32 offset{};
     std::vector<u8> container{};
+    bool failed{};
 
     friend struct Writer;
     friend struct Reader;
@@ -107,8 +122,11 @@ struct Writer {
 struct Reader {
     template <typename T>
     void Read(T* ptr, size_t size) {
-        ASSERT_MSG(ar.offset + size <= ar.container.size(),
-                   "Invalid or corrupted deserialization container/shader cache");
+        if (size > ar.Remaining()) {
+            std::memset(reinterpret_cast<void*>(ptr), 0, size);
+            ar.Fail();
+            return;
+        }
         std::memcpy(reinterpret_cast<void*>(ptr), ar.CurrPtr(), size);
         ar.Advance(size);
     }
@@ -123,7 +141,18 @@ struct Reader {
     void Read(auto& v) {
         size_t num_elements{};
         Read(num_elements);
-        for (int i = 0; i < num_elements; ++i) {
+        using Element = typename std::remove_cvref_t<decltype(v)>::value_type;
+        size_t element_size = 1;
+        if constexpr (!Container<Element> && std::is_trivially_copyable_v<Element>) {
+            element_size = sizeof(Element);
+        }
+
+        if (ar.Failed() || num_elements > ar.Remaining() / element_size) {
+            ar.Fail();
+            return;
+        }
+
+        for (size_t i = 0; i < num_elements && !ar.Failed(); ++i) {
             v.emplace_back();
             Read(v.back());
         }
@@ -132,6 +161,11 @@ struct Reader {
     void Read(std::string& s) {
         size_t length{};
         Read(length);
+        if (length > ar.Remaining()) {
+            ar.Fail();
+            return;
+        }
+
         s.resize(length);
         Read(s.data(), length);
     }
