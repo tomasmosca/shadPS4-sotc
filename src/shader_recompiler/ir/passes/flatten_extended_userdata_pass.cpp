@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+#include <xxhash.h>
 #include "common/arch.h"
 #include "common/decoder.h"
 #include "common/io_file.h"
@@ -30,8 +36,18 @@
 
 using namespace Xbyak::util;
 
-static Xbyak::CodeGenerator g_srt_codegen(32_MB);
-static const u8* g_srt_codegen_start = nullptr;
+constexpr size_t WalkerChunkSize = 32_MB;
+constexpr size_t MaxWalkerChunks = 16;
+
+static std::array<std::unique_ptr<Xbyak::CodeGenerator>, MaxWalkerChunks> g_srt_chunks;
+static std::atomic<size_t> g_srt_num_chunks{0};
+static std::array<std::atomic<size_t>, MaxWalkerChunks> g_srt_chunk_sizes{};
+static Xbyak::CodeGenerator g_srt_scratch(1_MB, Xbyak::DontSetProtectRWE);
+static std::mutex g_srt_codegen_mutex;
+
+namespace {
+static bool SrtWalkerSignalHandler(void* context, void* fault_address);
+}
 
 namespace Shader {
 
@@ -252,11 +268,63 @@ const void* GetWalkerLoadHelpers() {
     return g_walker_helpers;
 }
 
+static PFN_SrtWalker CommitWalkerCode(const u8* ptr, size_t size) {
+    // Pipelines that share a shader load the same walker
+    static std::unordered_multimap<u64, std::pair<PFN_SrtWalker, size_t>> registered;
+    const u64 hash = XXH3_64bits(ptr, size);
+    const auto [first, last] = registered.equal_range(hash);
+
+    for (auto it = first; it != last; ++it) {
+        const auto [func, func_size] = it->second;
+        if (func_size == size && std::memcmp(reinterpret_cast<const void*>(func), ptr, size) == 0) {
+            return func;
+        }
+    }
+
+    while (true) {
+        const size_t num_chunks = g_srt_num_chunks.load(std::memory_order_relaxed);
+
+        if (num_chunks > 0) {
+            auto& chunk = *g_srt_chunks[num_chunks - 1];
+            const auto func_addr = (PFN_SrtWalker)chunk.getCurr();
+            const size_t start = chunk.getSize();
+
+            try {
+                chunk.db(ptr, size);
+                chunk.ready();
+                g_srt_chunk_sizes[num_chunks - 1].store(chunk.getSize(), std::memory_order_release);
+                registered.emplace(hash, std::make_pair(func_addr, size));
+                return func_addr;
+            } catch (const Xbyak::Error&) {
+                chunk.setSize(start);
+            }
+        }
+
+        if (num_chunks == MaxWalkerChunks || size > WalkerChunkSize) {
+            LOG_ERROR(Render_Recompiler, "SRT walker code is too large, walker dropped");
+            return nullptr;
+        }
+
+        try {
+            g_srt_chunks[num_chunks] = std::make_unique<Xbyak::CodeGenerator>(WalkerChunkSize);
+        } catch (const Xbyak::Error&) {
+            LOG_ERROR(Render_Recompiler, "No memory for SRT walker code, walker dropped");
+            return nullptr;
+        }
+
+        if (num_chunks == 0) {
+            // Call after the memory invalidation handler
+            constexpr u32 priority = 1;
+            Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler,
+                                                                      priority);
+        }
+        g_srt_num_chunks.store(num_chunks + 1, std::memory_order_release);
+    }
+}
+
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-    const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
-    g_srt_codegen.db(ptr, size);
-    g_srt_codegen.ready();
-    return func_addr;
+    std::scoped_lock lk{g_srt_codegen_mutex};
+    return CommitWalkerCode(ptr, size);
 }
 
 } // namespace Shader
@@ -290,10 +358,18 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
 
 static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     // Only handle if the fault address is within the SRT code range
-    const u8* code_start = g_srt_codegen_start;
-    const u8* code_end = code_start + g_srt_codegen.getSize();
     const void* code = Common::GetRip(context);
-    if (code < code_start || code >= code_end) {
+    const auto* code_ptr = static_cast<const u8*>(code);
+    const size_t num_chunks = g_srt_num_chunks.load(std::memory_order_acquire);
+    bool in_walker = false;
+
+    for (size_t i = 0; i < num_chunks && !in_walker; ++i) {
+        const u8* chunk_code = g_srt_chunks[i]->getCode();
+        const size_t chunk_size = g_srt_chunk_sizes[i].load(std::memory_order_acquire);
+        in_walker = code_ptr >= chunk_code && code_ptr < chunk_code + chunk_size;
+    }
+
+    if (!in_walker) {
         return false; // Not in SRT code range
     }
 
@@ -929,37 +1005,36 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 }
 
 static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
-    Xbyak::CodeGenerator& c = g_srt_codegen;
+    Xbyak::CodeGenerator& c = g_srt_scratch;
 
     if (pass_info.srt_roots.empty()) {
         return;
     }
 
-    // Register the signal handler for SRT walker, if not already registered
-    if (g_srt_codegen_start == nullptr) {
-        g_srt_codegen_start = c.getCurr();
-        auto* signals = Core::Signals::Instance();
-        // Call after the memory invalidation handler
-        constexpr u32 priority = 1;
-        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-    }
-
-    info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
-    c.mov(r9, rdx); // load helper table (third argument)
+    std::scoped_lock lk{g_srt_codegen_mutex};
+    info.srt_info.walker_func = nullptr;
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
-    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
-        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+    c.reset();
+    try {
+        c.mov(r9, rdx); // load helper table (third argument)
+        for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+            VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+        }
+        c.ret();
+        // The code only calls through the helper table in r9, so it runs at any address
+        if (!c.hasUndefinedLabel()) {
+            info.srt_info.walker_func = CommitWalkerCode(c.getCode(), c.getSize());
+        }
+    } catch (const Xbyak::Error& e) {
+        LOG_ERROR(Render_Recompiler, "SRT walker of shader {:#x} failed: {}", info.pgm_hash,
+                  e.what());
     }
 
-    c.ret();
-    c.ready();
+    info.srt_info.walker_func_size = info.srt_info.walker_func ? c.getSize() : 0;
 
-    info.srt_info.walker_func_size =
-        c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
-
-    if (EmulatorSettings.IsDumpShaders()) {
+    if (info.srt_info.walker_func && EmulatorSettings.IsDumpShaders()) {
         DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
                        info.srt_info.walker_func_size);
     }
