@@ -19,7 +19,7 @@ Tested setup:
 - Game version 1.00.
 - Play sessions of more than 3 hours without a crash.
 
-The first time you enter an area, the emulator compiles its shaders and the game stutters. The next visits use the shader cache.
+The game starts without loading the whole shader cache. The emulator loads each shader from the cache when the game first uses it. The first time you enter an area, the emulator compiles its new shaders and the game stutters.
 
 ## How to use
 
@@ -54,6 +54,12 @@ Speed:
 - The emulator runs a copy shader of the game as a plain buffer copy.
 - The emulator reuses identical buffer uploads, draw state and shader variants.
 - The shader resource walker caches the guest memory pages that it reads.
+- Shaders load from the cache when the game first uses them, not all at startup. The driver pipeline cache is saved to `pipelines.vkc` in the shader cache folder.
+- A background thread loads the cached shaders in the order that the game used them before. This order is saved to `programs.order` in the shader cache folder.
+
+Sound:
+
+- The emulator keeps about 30 ms of sound queued for the audio device. A short delay of the game does not cause crackling.
 
 Graphics fixes:
 
@@ -98,13 +104,14 @@ The fork adds these settings to the `GPU` section of `config.json` and of the ga
 | `lds_barrier_uniform_readlane` | `true` | Adds barriers around lane reads that go through shared memory. |
 | `nan_aware_min_max` | `true` | Uses the GCN rules for NaN in min and max. |
 | `relative_instance_id` | `true` | Starts the instance ID at 0 in every draw, like the PS4 GPU. |
+| `preload_pipelines` | `false` | Creates all the cached pipelines at startup, like upstream. |
 
 `shader_loop_cap` and the settings from `dynamic_tsharp_array_size` to `relative_instance_id` change the shaders. When you change one of them, the emulator compiles the shaders again.
 
 ## Credits
 
 - The [shadPS4](https://github.com/shadps4-emu/shadPS4) team, for the emulator.
-- [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4), implemented various of the graphical fixes.
+- Various existing graphical fixes from other forks (Pink-shadPS4, AjncSystem).
 
 ## License
 
