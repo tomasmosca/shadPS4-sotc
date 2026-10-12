@@ -5,7 +5,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 for Shadow of the Colossus
 
-This is an experimental fork of [shadPS4](https://github.com/shadps4-emu/shadPS4), the PlayStation 4 emulator. It makes Shadow of the Colossus (CUSA08809) playable on a mid-range Windows PC.
+This is an experimental fork of [shadPS4](https://github.com/shadps4-emu/shadPS4), the PlayStation 4 emulator. It is mainly focused on performance, and makes Shadow of the Colossus (CUSA08809) playable on a mid-range Windows PC.
 
 The fork starts from upstream commit `94e2177` (September 29, 2026). It changes the GPU emulation only. For anything else, read the [upstream README](https://github.com/shadps4-emu/shadPS4#readme).
 
