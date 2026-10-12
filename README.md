@@ -38,12 +38,15 @@ The game starts without loading the whole shader cache. The emulator loads each 
     "pipeline_cache_enabled": true
   },
   "General": {
-    "redzone_patches": true
+    "redzone_patches": true,
+    "extra_dmem_in_mbytes": 2048
   }
 }
 ```
 
 The game needs `readbacks_mode` 2 (precise). Without it, the menu is black and the game has no textures.
+
+`extra_dmem_in_mbytes` gives the game 2 GB more memory. Without it, the game can run out of GPU memory and crash during the end credits.
 
 ## What changes
 
@@ -74,7 +77,7 @@ Stability:
 - Buffer memory that was not used for some time is released when video memory is low. Before this, long sessions ended with an out of memory crash.
 - The exception handler runs on its own stack. The game runs its jobs on small stacks.
 - The emulator tracks the guest thread and fiber stacks, and it does not protect their pages.
-- Safer fault handling for direct memory access shaders (upstream pull request #4738).
+- Safer fault handling for direct memory access shaders.
 
 [documents/sotc-fork-notes.md](documents/sotc-fork-notes.md) explains how the parts keep memory coherent and lists the known limitations.
 
